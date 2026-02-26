@@ -42,7 +42,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QColorDialog
 from PyQt6.QtGui import QColor
 
-from .core.detection import (
+from .utils.processing import (
     TEMPLATE_TARGET_FS,
     _build_parallel_template_banks,
     _filter_peaks_by_reference,
@@ -55,7 +55,7 @@ from .core.detection import (
     process_cell_template_matching,
     _select_event_bank,
 )
-from .io.session import load_session_path
+from .utils.session import load_session_path
 from .utils.export import save_figure_with_dialog
 from .utils.stats import mean_std_count
 
@@ -944,8 +944,8 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
     return snr_list
 
 
-# Rebind processing helpers from extracted core module (keeps GUI code unchanged).
-from .core.detection import (
+# Rebind processing helpers from extracted utils module (keeps GUI code unchanged).
+from .utils.processing import (
     TEMPLATE_TARGET_FS,
     _build_parallel_template_banks,
     _filter_peaks_by_reference,

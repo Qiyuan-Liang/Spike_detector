@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
@@ -16,9 +17,11 @@ hiddenimports = [
 datas = []
 datas += collect_data_files('matplotlib', include_py_files=False)
 
+ROOT = Path(__file__).resolve().parents[2]
+
 a = Analysis(
-    ['gui_preprocess_V3.3.py'],
-    pathex=['src'],
+    [str(ROOT / 'gui_preprocess_V3.3.py')],
+    pathex=[str(ROOT / 'src')],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
