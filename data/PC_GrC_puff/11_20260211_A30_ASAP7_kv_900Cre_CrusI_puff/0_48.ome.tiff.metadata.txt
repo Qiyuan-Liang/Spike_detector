@@ -1,0 +1,56 @@
+%Metadata for:
+FileName: 20260211_A30_ASAP7_kv_900Cre_CrusI_puff.mesc
+MestagMemo: 11,0,48
+Type: ZStack
+Comment: 
+MeasurementDate: 2026:02:11 12:48:38,934
+creatingMESVersion: MES v8.5.18085
+creatingVersion: MESc 4.6.1.14184
+experimenterHostname: FEMTO-0443
+experimenterProfilename: HausserLab
+experimenterSetupID: SN20250182003-MHausser_1
+experimenterUsername: measurement
+ZlevelArm: 0
+ZlevelOrigin: -29126.5
+ZlevelFast: 0
+>Devices start
+ AO: 15
+ AO1_DichroSwitch: 0
+ AO1_ThermalStabilization: 1
+ AtlasBSWaveplate_LP1: 1.5562500000000001
+ AtlasBSWaveplate_LP2: 1.20625
+ CameraSwitchDevice: 0
+ FastZ: 0
+ GDD1: -66.997
+ GDD2: -66.999
+ GreenLamp: 11.024489763999995
+ GreenLamp_EN: 0
+ ObjectiveArm: -29249.41
+ UG: 80
+ UR: 0
+ deflectorDistance_XY1: 0
+ deflectorDistance_XY2: 0
+ dummy: 16
+ laser_LP1: 920
+ laser_LP2: 1040
+ power_LP1: 100
+ power_LP2: 100
+ servoCam2P: 1.3
+ servoLamp2P: 0.038
+ wavelength_LP1: 920
+ wavelength_LP2: 1040
+<Devices end
+>Context start
+%SIZE
+ Width: 504
+ Height: 504
+>>Viewport start: 0
+  WidthOrigin: 300
+  HeightOrigin: 300
+  Rotation: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  Translation: [-150, -150, -29249.4]
+<<Viewport end
+ Average: 1
+ Channel: UG
+ DataType: float
+<Context end

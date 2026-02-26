@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spike-detector-gui"
+version = "3.3.0"
+description = "GUI spike detector for CS/SS activity in Purkinje neurons"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "matplotlib",
+  "PyQt6",
+  "openpyxl",
+]
+
+[project.scripts]
+spike-detector = "spike_detector.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
