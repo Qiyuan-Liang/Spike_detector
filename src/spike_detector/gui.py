@@ -4,7 +4,7 @@ Cross-platform (Mac/Windows) PyQt GUI that loads session folders containing
 either analyzed NPZ files (created by your notebook) or raw Excel traces.
 
 Features:
-- Select master folder containing session subfolders
+- Select master folder containing session files
 - List and load sessions (npz or xlsx)
 - Visualize raw traces, baseline, CS/SS streams, and detected spikes
 - Adjustable detection parameters (thresholds, filter bands, smoothing)
@@ -140,8 +140,9 @@ except Exception:
 def _scaled_size(px_w, px_h):
     """Scale a (width,height) pair by the detected screen scale factor and return ints."""
     try:
-        s = _get_screen_scale()
-        return max(1, int(round(float(px_w) * s))), max(1, int(round(float(px_h) * s)))
+        # Keep top-level window sizes in logical pixels and let Qt handle DPI scaling.
+        # This avoids oversized windows on Windows high-DPI displays.
+        return max(1, int(round(float(px_w)))), max(1, int(round(float(px_h))))
     except Exception:
         return px_w, px_h
 
@@ -174,6 +175,14 @@ def _scale_font(base=10):
         return int(round(float(base) * (1.0 + 0.15 * max(0.0, s - 1.0))))
     except Exception:
         return base
+
+
+def _stats_window_ms(spike_type):
+    """Per-type waveform window used for SNR/FWHM statistics.
+
+    Keep this centralized so summary text and Spike Statistics viewer stay aligned.
+    """
+    return 100.0 if str(spike_type).upper() == 'CS' else 50.0
 
 
 def _set_frame_hline(frame):
@@ -753,7 +762,9 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
                         ss_low_cut=50.0, ss_high_cut=700.0, ss_thresh_sigma=2.0,
                         ss_min_dist_ms=2, ss_blank_ms=8, ss_min_width_ms=1, ss_max_width_ms=6,
                         use_preprocessed=False, pre_detrended=None, pre_baseline=None,
-                        initial_blank_ms=0.0, cs_order=3, ss_order=3):
+                        initial_blank_ms=0.0, cs_order=3, ss_order=3,
+                        local_baseline=False, local_baseline_cs_ms=200.0,
+                        local_baseline_ss_ms=50.0):
     # allow upstream code to provide averaged + baseline-corrected (detrended) signal
     working = raw_trace * -1 if negative_going else raw_trace
     if use_preprocessed and pre_detrended is not None and pre_baseline is not None:
@@ -782,7 +793,19 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
     cs_dist = int((cs_min_dist_ms / 1000.0) * fs)
     if cs_dist < 1:
         cs_dist = 1
-    cs_candidates, _ = find_peaks(cs_trace, height=cs_thresh_sigma * sigma_cs, distance=cs_dist)
+
+    # CS threshold: local or global
+    if local_baseline:
+        from .utils.processing import estimate_noise_mad_local
+        cs_win_samples = max(5, int((local_baseline_cs_ms / 1000.0) * fs))
+        cs_local_sigma = estimate_noise_mad_local(cs_trace, cs_win_samples)
+        cs_threshold_trace = cs_thresh_sigma * cs_local_sigma
+        cs_candidates, _ = find_peaks(cs_trace, distance=cs_dist)
+        cs_candidates = cs_candidates[cs_trace[cs_candidates] >= cs_threshold_trace[cs_candidates]]
+    else:
+        cs_threshold_trace = None
+        cs_candidates, _ = find_peaks(cs_trace, height=cs_thresh_sigma * sigma_cs, distance=cs_dist)
+
     # remove peaks that fall within the initial blank period (if any)
     if initial_blank_ms is not None and initial_blank_ms > 0:
         init_blank_samples = int((initial_blank_ms / 1000.0) * fs)
@@ -810,12 +833,29 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
         sigma_ss_filtered = estimate_noise_mad(ss_trace_clean)
     ss_dist = int((ss_min_dist_ms / 1000.0) * fs)
     ss_dist = max(1, ss_dist)
-    w_min = (ss_min_width_ms / 1000.0) * fs
-    w_max = (ss_max_width_ms / 1000.0) * fs
-    try:
-        ss_candidates, _ = find_peaks(ss_trace_clean, height=ss_thresh_sigma * sigma_ss_filtered, distance=ss_dist, width=(w_min, w_max), rel_height=0.5)
-    except Exception:
-        ss_candidates = np.array([], dtype=int)
+
+    # SS threshold: local or global
+    if local_baseline:
+        from .utils.processing import estimate_noise_mad_local
+        ss_win_samples = max(5, int((local_baseline_ss_ms / 1000.0) * fs))
+        ss_local_sigma = estimate_noise_mad_local(ss_trace_clean, ss_win_samples)
+        ss_threshold_trace = ss_thresh_sigma * ss_local_sigma
+        try:
+            ss_candidates, _ = find_peaks(ss_trace_clean, distance=ss_dist)
+            ss_candidates = ss_candidates[ss_trace_clean[ss_candidates] >= ss_threshold_trace[ss_candidates]]
+        except Exception:
+            ss_candidates = np.array([], dtype=int)
+    else:
+        ss_threshold_trace = None
+        try:
+            ss_candidates, _ = find_peaks(
+                ss_trace_clean,
+                height=ss_thresh_sigma * sigma_ss_filtered,
+                distance=ss_dist,
+            )
+        except Exception:
+            ss_candidates = np.array([], dtype=int)
+
     # No local SNR filtering: accept SS candidates directly, but exclude initial blank
     if initial_blank_ms is not None and initial_blank_ms > 0:
         init_blank_samples = int((initial_blank_ms / 1000.0) * fs)
@@ -823,7 +863,7 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
     else:
         ss_peaks = ss_candidates
 
-    return {
+    result = {
         'detrended': detrended,
         'baseline': baseline,
         'cs_trace': cs_trace,
@@ -834,10 +874,20 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
         'sigma_ss': sigma_ss_filtered,
         'raw_sigma': global_sigma,
         'det_method': 'Threshold',
-        'threshold_mode': 'Sigma x MAD',
+        'threshold_mode': 'Sigma x MAD (local)' if local_baseline else 'Sigma x MAD',
         'cs_threshold_used': float(cs_thresh_sigma * sigma_cs),
         'ss_threshold_used': float(ss_thresh_sigma * sigma_ss_filtered),
+        'local_baseline': bool(local_baseline),
+        'ss_width_filter_enabled': False,
+        'ss_min_dist_ms_used': float(ss_min_dist_ms),
+        'ss_blank_ms_used': float(ss_blank_ms),
+        'initial_blank_ms_used': float(initial_blank_ms) if initial_blank_ms is not None else 0.0,
     }
+    if cs_threshold_trace is not None:
+        result['cs_threshold_trace'] = cs_threshold_trace
+    if ss_threshold_trace is not None:
+        result['ss_threshold_trace'] = ss_threshold_trace
+    return result
 
 
 def get_interpolated_wave(wave, fs, upscale_factor=10):
@@ -1026,6 +1076,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'TEMPLATE_PARALLEL': False,
             'TEMPLATE_CS_SIGMA': 6.0,
             'TEMPLATE_SS_SIGMA': 4.0,
+            'LOCAL_BASELINE': False,
+            'LOCAL_BASELINE_SS_MS': 50.0,
+            'LOCAL_BASELINE_CS_MS': 200.0,
             }
 
         # Template banks (each can be loaded from one file or a folder)
@@ -1296,6 +1349,29 @@ class MainWindow(QtWidgets.QMainWindow):
         h_ss_thresh.addWidget(QtWidgets.QLabel('SS threshold (σ):'))
         h_ss_thresh.addWidget(self.spin_ss_thresh)
         lay_threshold.addLayout(h_ss_thresh)
+        lay_threshold.addSpacing(4)
+        h_local_bl = QtWidgets.QHBoxLayout()
+        self.chk_local_baseline = QtWidgets.QCheckBox('Local baseline')
+        self.chk_local_baseline.setChecked(bool(self.params.get('LOCAL_BASELINE', False)))
+        self.chk_local_baseline.stateChanged.connect(lambda v: (self.params.update({'LOCAL_BASELINE': bool(v)}), self.update_plot()))
+        h_local_bl.addWidget(self.chk_local_baseline)
+        h_local_bl.addWidget(QtWidgets.QLabel('SS win (ms):'))
+        self.spin_local_ss_ms = QtWidgets.QDoubleSpinBox()
+        self.spin_local_ss_ms.setRange(5.0, 5000.0)
+        self.spin_local_ss_ms.setDecimals(1)
+        self.spin_local_ss_ms.setSingleStep(10.0)
+        self.spin_local_ss_ms.setValue(self.params.get('LOCAL_BASELINE_SS_MS', 50.0))
+        self.spin_local_ss_ms.valueChanged.connect(lambda v: (self.params.update({'LOCAL_BASELINE_SS_MS': float(v)}), self.update_plot()))
+        h_local_bl.addWidget(self.spin_local_ss_ms)
+        h_local_bl.addWidget(QtWidgets.QLabel('CS win (ms):'))
+        self.spin_local_cs_ms = QtWidgets.QDoubleSpinBox()
+        self.spin_local_cs_ms.setRange(5.0, 5000.0)
+        self.spin_local_cs_ms.setDecimals(1)
+        self.spin_local_cs_ms.setSingleStep(10.0)
+        self.spin_local_cs_ms.setValue(self.params.get('LOCAL_BASELINE_CS_MS', 200.0))
+        self.spin_local_cs_ms.valueChanged.connect(lambda v: (self.params.update({'LOCAL_BASELINE_CS_MS': float(v)}), self.update_plot()))
+        h_local_bl.addWidget(self.spin_local_cs_ms)
+        lay_threshold.addLayout(h_local_bl)
         lay_threshold.addStretch(1)
         tab_threshold.setLayout(lay_threshold)
 
@@ -1978,6 +2054,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f'Master folder: {folder}')
             self.refresh_sessions()
 
+    def _list_table_files_in_dir(self, folder_path):
+        files = []
+        try:
+            for name in os.listdir(folder_path):
+                fp = os.path.join(folder_path, name)
+                if not os.path.isfile(fp):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in {'.xlsx', '.csv'}:
+                    files.append(fp)
+        except Exception:
+            return []
+        return sorted(files)
+
+    def _session_dir_has_supported_data(self, folder_path):
+        try:
+            if glob.glob(os.path.join(folder_path, '*_analyzed.npz')):
+                return True
+            if self._list_table_files_in_dir(folder_path):
+                return True
+
+            # Also check centralized parent spike_detection exports.
+            parent = os.path.dirname(folder_path)
+            sd_dir = os.path.join(parent, 'spike_detection')
+            folder_name = os.path.basename(folder_path)
+            if os.path.isfile(os.path.join(sd_dir, folder_name + '_analyzed.npz')):
+                return True
+            if glob.glob(os.path.join(sd_dir, folder_name + '*_analyzed.npz')):
+                return True
+        except Exception:
+            return False
+        return False
+
     def _count_sessions_and_cells(self, candidates):
         """Return (n_sessions, total_cells, cells_per_session list)
         candidates: list of file or directory paths"""
@@ -2001,16 +2110,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     # directory: look for analyzed npz or xlsx inside
                     npz_list = glob.glob(os.path.join(s, '*_analyzed.npz'))
-                    xls_list = glob.glob(os.path.join(s, '*.xlsx'))
-                    csv_list = glob.glob(os.path.join(s, '*.csv'))
+                    table_list = self._list_table_files_in_dir(s)
                     if npz_list:
                         npz = np.load(npz_list[0], allow_pickle=True)
                         n = len(npz['cell_names']) if 'cell_names' in npz else 0
-                    elif xls_list:
-                        df = pd.read_excel(xls_list[0], nrows=0, engine='openpyxl')
-                        n = max(0, df.shape[1] - 1)
-                    elif csv_list:
-                        df = pd.read_csv(csv_list[0], nrows=0)
+                    elif table_list:
+                        first_tbl = table_list[0]
+                        if first_tbl.lower().endswith('.xlsx'):
+                            df = pd.read_excel(first_tbl, nrows=0, engine='openpyxl')
+                        else:
+                            df = pd.read_csv(first_tbl, nrows=0)
                         n = max(0, df.shape[1] - 1)
                     else:
                         n = 0
@@ -2131,7 +2240,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                                              initial_blank_ms=self.params.get('INITIAL_BLANK_MS', 150.0),
                                                              use_preprocessed=True, pre_detrended=pre_detr, pre_baseline=baseline_gui,
                                                              cs_order=int(self.params.get('CS_FILTER_ORDER', 4)),
-                                                             ss_order=int(self.params.get('SS_FILTER_ORDER', 4)))
+                                                             ss_order=int(self.params.get('SS_FILTER_ORDER', 4)),
+                                                             local_baseline=bool(self.params.get('LOCAL_BASELINE', False)),
+                                                             local_baseline_cs_ms=float(self.params.get('LOCAL_BASELINE_CS_MS', 200.0)),
+                                                             local_baseline_ss_ms=float(self.params.get('LOCAL_BASELINE_SS_MS', 50.0)))
                             tol_cs = max(1, int(round((2.0 / 1000.0) * fs)))
                             tol_ss = max(1, int(round((1.0 / 1000.0) * fs)))
                             cs_keep = _filter_peaks_by_reference(res_tm.get('cs_peaks', []), res_simple.get('cs_peaks', []), tol_cs)
@@ -2143,8 +2255,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             res['ss_simple_trace'] = np.asarray(res_simple.get('ss_trace', np.zeros_like(raw_proc)), dtype=float)
                             res['cs_simple_sigma'] = float(res_simple.get('sigma_cs', np.nan))
                             res['ss_simple_sigma'] = float(res_simple.get('sigma_ss', np.nan))
-                            res['cs_simple_threshold_used'] = float(self.params.get('CS_THRESHOLD_SIGMA', 6.0) * res.get('cs_simple_sigma', np.nan)) if np.isfinite(res.get('cs_simple_sigma', np.nan)) else np.nan
-                            res['ss_simple_threshold_used'] = float(self.params.get('SS_THRESHOLD_SIGMA', 2.0) * res.get('ss_simple_sigma', np.nan)) if np.isfinite(res.get('ss_simple_sigma', np.nan)) else np.nan
+                            if res_simple.get('local_baseline', False):
+                                res['cs_simple_threshold_used'] = np.nan
+                                res['ss_simple_threshold_used'] = np.nan
+                                res['cs_simple_threshold_trace'] = np.asarray(res_simple.get('cs_threshold_trace', np.array([])), dtype=float)
+                                res['ss_simple_threshold_trace'] = np.asarray(res_simple.get('ss_threshold_trace', np.array([])), dtype=float)
+                                res['simple_local_baseline'] = True
+                            else:
+                                res['cs_simple_threshold_used'] = float(self.params.get('CS_THRESHOLD_SIGMA', 6.0) * res.get('cs_simple_sigma', np.nan)) if np.isfinite(res.get('cs_simple_sigma', np.nan)) else np.nan
+                                res['ss_simple_threshold_used'] = float(self.params.get('SS_THRESHOLD_SIGMA', 2.0) * res.get('ss_simple_sigma', np.nan)) if np.isfinite(res.get('ss_simple_sigma', np.nan)) else np.nan
+                                res['simple_local_baseline'] = False
                             res['two_step_enabled'] = True
                             res['det_method'] = f"{res_tm.get('det_method', 'Template Matching')} + Two-step"
                         else:
@@ -2164,7 +2284,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                                   initial_blank_ms=self.params.get('INITIAL_BLANK_MS', 150.0),
                                                   use_preprocessed=True, pre_detrended=pre_detr, pre_baseline=baseline_gui,
                                                   cs_order=int(self.params.get('CS_FILTER_ORDER', 4)),
-                                                  ss_order=int(self.params.get('SS_FILTER_ORDER', 4)))
+                                                  ss_order=int(self.params.get('SS_FILTER_ORDER', 4)),
+                                                  local_baseline=bool(self.params.get('LOCAL_BASELINE', False)),
+                                                  local_baseline_cs_ms=float(self.params.get('LOCAL_BASELINE_CS_MS', 200.0)),
+                                                  local_baseline_ss_ms=float(self.params.get('LOCAL_BASELINE_SS_MS', 50.0)))
                     data['results'][i] = res
                     data['spike_times_cs'][i] = (res['cs_peaks'] / fs) * 1000.0
                     data['spike_times_ss'][i] = (res['ss_peaks'] / fs) * 1000.0
@@ -2173,21 +2296,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 # After finishing a session, save results to an npz file adjacent to source
                 try:
                     session_src = data.get('session_path', None)
-                    save_dir = None
                     base = sname
                     if session_src and os.path.isfile(session_src):
                         base = os.path.splitext(os.path.basename(session_src))[0]
-                        if session_src.lower().endswith('.xlsx'):
-                            # Notebook creates a folder named after the file (base) and
-                            # writes <base>_analyzed.npz inside it — match that behavior.
-                            save_dir = os.path.join(os.path.dirname(session_src), base)
-                        else:
-                            save_dir = os.path.dirname(session_src)
-                    elif session_src and os.path.isdir(session_src):
-                        save_dir = session_src
-                    else:
-                        # fallback: use master_folder or current working dir
-                        save_dir = getattr(self, 'master_folder', os.getcwd()) or os.getcwd()
+                    # Save all analyzed NPZ files into a single spike_detection/ folder
+                    master = getattr(self, 'master_folder', None) or os.getcwd()
+                    save_dir = os.path.join(master, 'spike_detection')
                     try:
                         os.makedirs(save_dir, exist_ok=True)
                     except Exception:
@@ -2244,8 +2358,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
         # After all sessions processed: compute overall averaged statistics across sessions/cells
         try:
-            window_ms = 100
-            half_win = None
             for sname, data in self.loaded_sessions.items():
                 try:
                     res_list = data.get('results', [])
@@ -2254,8 +2366,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     fs = float(data.get('fs', 1000.0))
                     tvec = np.array(data.get('time_ms', []))
                     duration_s = (tvec[-1] - tvec[0]) / 1000.0 if tvec.size>1 else np.nan
-                    if half_win is None:
-                        half_win = int((window_ms/2.0) * fs / 1000.0)
                     for res in res_list:
                         if res is None:
                             continue
@@ -2267,24 +2377,28 @@ class MainWindow(QtWidgets.QMainWindow):
                             pass
                         # CS events
                         try:
+                            cs_window_ms = _stats_window_ms('CS')
+                            cs_half_win = int((cs_window_ms / 2.0) * fs / 1000.0)
                             cs_peaks = np.array(res.get('cs_peaks', []), dtype=int)
                             raw_cs = res.get('cs_trace', None)
                             raw_all = res.get('detrended', None)
                             sigma_cs = res.get('sigma_cs', np.nan)
                             sigma_raw = res.get('raw_sigma', np.nan)
                             if raw_cs is not None and cs_peaks.size>0:
-                                cs_event_snrs = compute_event_snrs(res, 'CS', fs, window_ms=window_ms, max_per_cell=None)
+                                cs_event_snrs = compute_event_snrs(res, 'CS', fs, window_ms=cs_window_ms, max_per_cell=None)
                                 global_cs_snrs.extend(cs_event_snrs)
                                 chosen = _select_event_bank(cs_peaks, max_per_cell=None)
                                 for p in chosen:
-                                    s = int(p - half_win); e = int(p + half_win)
+                                    s = int(p - cs_half_win); e = int(p + cs_half_win)
                                     if s < 0 or e >= len(raw_cs):
                                         continue
                                     wave = raw_cs[s:e]
-                                    if len(wave) != (2*half_win):
+                                    if len(wave) != (2 * cs_half_win):
                                         continue
+                                    if len(wave) > 5:
+                                        wave = wave - np.mean(wave[:5])
                                     _, interp = get_interpolated_wave(wave, fs)
-                                    t_d = np.linspace(-window_ms/2.0, window_ms/2.0, len(interp))
+                                    t_d = np.linspace(-cs_window_ms / 2.0, cs_window_ms / 2.0, len(interp))
                                     _, fwhm = get_wave_stats(interp, t_d)
                                     if not np.isnan(fwhm):
                                         global_cs_fwhm.append(fwhm)
@@ -2292,22 +2406,26 @@ class MainWindow(QtWidgets.QMainWindow):
                             pass
                         # SS events
                         try:
+                            ss_window_ms = _stats_window_ms('SS')
+                            ss_half_win = int((ss_window_ms / 2.0) * fs / 1000.0)
                             ss_peaks = np.array(res.get('ss_peaks', []), dtype=int)
                             ss_trace = res.get('ss_trace', None)
                             ss_source = ss_trace if ss_trace is not None else raw_all
                             if ss_source is not None and ss_peaks.size>0:
-                                ss_event_snrs = compute_event_snrs(res, 'SS', fs, window_ms=window_ms, max_per_cell=None)
+                                ss_event_snrs = compute_event_snrs(res, 'SS', fs, window_ms=ss_window_ms, max_per_cell=None)
                                 global_ss_snrs.extend(ss_event_snrs)
                                 chosen = _select_event_bank(ss_peaks, max_per_cell=None)
                                 for p in chosen:
-                                    s = int(p - half_win); e = int(p + half_win)
+                                    s = int(p - ss_half_win); e = int(p + ss_half_win)
                                     if s < 0 or e >= len(ss_source):
                                         continue
                                     wave = ss_source[s:e]
-                                    if len(wave) != (2*half_win):
+                                    if len(wave) != (2 * ss_half_win):
                                         continue
+                                    if len(wave) > 5:
+                                        wave = wave - np.mean(wave[:5])
                                     _, interp = get_interpolated_wave(wave, fs)
-                                    t_d = np.linspace(-window_ms/2.0, window_ms/2.0, len(interp))
+                                    t_d = np.linspace(-ss_window_ms / 2.0, ss_window_ms / 2.0, len(interp))
                                     _, fwhm = get_wave_stats(interp, t_d)
                                     if not np.isnan(fwhm):
                                         global_ss_fwhm.append(fwhm)
@@ -2339,6 +2457,13 @@ class MainWindow(QtWidgets.QMainWindow):
                         summary.append(
                             f"Template thresholds (Sigma x MAD): CS sigma={self.params.get('TEMPLATE_CS_SIGMA', 6.0):.2f}, "
                             f"SS sigma={self.params.get('TEMPLATE_SS_SIGMA', 4.0):.2f}"
+                        )
+                    else:
+                        summary.append(
+                            f"Simple threshold criteria: SS height >= {self.params.get('SS_THRESHOLD_SIGMA', 2.0):.2f}xMAD, "
+                            f"SS min distance = {self.params.get('SS_MIN_DIST_MS', 2.0):.2f} ms, "
+                            f"CS-blank window = {self.params.get('SS_BLANK_MS', 8.0):.2f} ms, "
+                            f"initial blank = {self.params.get('INITIAL_BLANK_MS', 150.0):.2f} ms"
                         )
                     summary.append('Overall CS:')
                     summary.append(f'  Rate: {cs_r_mean:.2f}±{cs_r_std:.2f} Hz (cells: {cs_r_n}) | SNR: {cs_snr_mean:.2f}±{cs_snr_std:.2f} (events: {cs_snr_n}) | FWHM: {cs_fwhm_mean:.2f}±{cs_fwhm_std:.2f} ms (events: {cs_fwhm_n})')
@@ -2429,6 +2554,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 'TEMPLATE_PARALLEL': False,
                 'TEMPLATE_CS_SIGMA': 6.0,
                 'TEMPLATE_SS_SIGMA': 4.0,
+                'LOCAL_BASELINE': False,
+                'LOCAL_BASELINE_SS_MS': 50.0,
+                'LOCAL_BASELINE_CS_MS': 200.0,
             }
             self.template_store = {
                 'cs_templates': [],
@@ -2466,6 +2594,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.chk_template_parallel.setChecked(bool(self.params.get('TEMPLATE_PARALLEL', False)))
                 self.spin_template_cs_sigma.setValue(self.params['TEMPLATE_CS_SIGMA'])
                 self.spin_template_ss_sigma.setValue(self.params['TEMPLATE_SS_SIGMA'])
+                if hasattr(self, 'chk_local_baseline') and self.chk_local_baseline is not None:
+                    self.chk_local_baseline.setChecked(False)
+                if hasattr(self, 'spin_local_ss_ms') and self.spin_local_ss_ms is not None:
+                    self.spin_local_ss_ms.setValue(50.0)
+                if hasattr(self, 'spin_local_cs_ms') and self.spin_local_cs_ms is not None:
+                    self.spin_local_cs_ms.setValue(200.0)
             except Exception:
                 pass
             try:
@@ -2494,27 +2628,45 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         candidates = []
         names = []
-        # 1) Top-level files
-        top_xls = sorted(glob.glob(os.path.join(self.master_folder, '*.xlsx')))
-        top_csv = sorted(glob.glob(os.path.join(self.master_folder, '*.csv')))
-        for f in top_xls + top_csv:
-            candidates.append(f)
-            names.append(os.path.basename(f))
-        # 2) Subfolders
-        for d in sorted(glob.glob(os.path.join(self.master_folder, '*'))):
-            if os.path.isdir(d):
-                xls_list = glob.glob(os.path.join(d, '*.xlsx'))
-                csv_list = glob.glob(os.path.join(d, '*.csv'))
-                if xls_list or csv_list:
-                    candidates.append(d)
-                    names.append(os.path.basename(d))
+        preloaded = {}
+        skipped_invalid = 0
+        # Top-level files only: do not traverse subfolders for session discovery.
+        try:
+            default_fs = float(self.params.get('FS', 1000.0))
+            for name in sorted(os.listdir(self.master_folder)):
+                fp = os.path.join(self.master_folder, name)
+                if not os.path.isfile(fp):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in {'.xlsx', '.csv', '.npz'}:
+                    try:
+                        data = load_session_path(fp, default_fs=default_fs)
+                        raw = np.asarray(data.get('raw_data', []), dtype=float)
+                        t = np.asarray(data.get('time_ms', []), dtype=float)
+                        cell_names = list(data.get('cell_names', []))
+                        if raw.ndim != 2 or raw.shape[0] < 2 or raw.shape[1] < 1 or t.size < 2 or len(cell_names) < 1:
+                            skipped_invalid += 1
+                            continue
+                        candidates.append(fp)
+                        names.append(name)
+                        preloaded[name] = data
+                    except Exception:
+                        skipped_invalid += 1
+        except Exception:
+            pass
         self.sessions = candidates
         self.session_names = names
         # populate compact combo box
         self.list_sessions.clear()
         for n in self.session_names:
             self.list_sessions.addItem(n)
-        self.loaded_sessions = {}
+        self.loaded_sessions = preloaded
+        try:
+            self.statusBar().showMessage(
+                f'Master folder: {self.master_folder} | sessions: {len(candidates)}, skipped invalid: {skipped_invalid}'
+            )
+        except Exception:
+            pass
         if self.sessions:
             # set current index and explicitly call handler to load session
             self.list_sessions.setCurrentIndex(0)
@@ -2955,7 +3107,10 @@ class SliderViewerDialog(QtWidgets.QDialog):
                   ss_thresh_sigma=params.get('SS_THRESHOLD_SIGMA', 2.0),
                   ss_min_dist_ms=params.get('SS_MIN_DIST_MS', 2.0),
                   ss_blank_ms=params.get('SS_BLANK_MS', 8.0),
-                  use_preprocessed=True, pre_detrended=pre_detr_viz, pre_baseline=baseline_gui)
+                  use_preprocessed=True, pre_detrended=pre_detr_viz, pre_baseline=baseline_gui,
+                  local_baseline=bool(params.get('LOCAL_BASELINE', False)),
+                  local_baseline_cs_ms=float(params.get('LOCAL_BASELINE_CS_MS', 200.0)),
+                  local_baseline_ss_ms=float(params.get('LOCAL_BASELINE_SS_MS', 50.0)))
 
         # baseline_display should be the baseline estimated for the raw (after averaging).
         # Use the GUI baseline (computed above) or the one returned by detection if present.
@@ -2971,9 +3126,15 @@ class SliderViewerDialog(QtWidgets.QDialog):
             self.ax_raw.plot(t[mask], baseline_display[mask], color=colors.get('baseline', '#FFC20A'), ls='--', lw=_get_linewidth(1.6))
 
         self.ax_cs.plot(t[mask], det['cs_trace'][mask], color=colors.get('cs_trace', '#009E73'))
-        self.ax_cs.axhline(params.get('CS_THRESHOLD_SIGMA', 6.0) * det['sigma_cs'], color=colors.get('cs_thresh', '#56B4E9'), ls='--')
+        if det.get('local_baseline', False) and 'cs_threshold_trace' in det:
+            self.ax_cs.plot(t[mask], det['cs_threshold_trace'][mask], color=colors.get('cs_thresh', '#56B4E9'), ls='--')
+        else:
+            self.ax_cs.axhline(params.get('CS_THRESHOLD_SIGMA', 6.0) * det['sigma_cs'], color=colors.get('cs_thresh', '#56B4E9'), ls='--')
         self.ax_ss.plot(t[mask], det['ss_trace'][mask], color=colors.get('ss_trace', '#D55E00'))
-        self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 2.0) * det['sigma_ss'], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
+        if det.get('local_baseline', False) and 'ss_threshold_trace' in det:
+            self.ax_ss.plot(t[mask], det['ss_threshold_trace'][mask], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
+        else:
+            self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 2.0) * det['sigma_ss'], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
 
         # overlay spikes
         cs_times = (det['cs_peaks'] / fs) * 1000.0
@@ -3289,8 +3450,14 @@ class DetectionViewerDialog(QtWidgets.QDialog):
                 if np.isfinite(ss_thr_line):
                     self.ax_ss.axhline(ss_thr_line, color=colors.get('ss_thresh', '#CC79A7'), ls='--')
             else:
-                self.ax_cs.axhline(params.get('CS_THRESHOLD_SIGMA', 6.0) * res.get('sigma_cs', 0.0), color=colors.get('cs_thresh', '#56B4E9'), ls='--')
-                self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 2.0) * res.get('sigma_ss', 0.0), color=colors.get('ss_thresh', '#CC79A7'), ls='--')
+                if res.get('local_baseline', False) and 'cs_threshold_trace' in res:
+                    self.ax_cs.plot(t[mask], np.asarray(res['cs_threshold_trace'])[mask], color=colors.get('cs_thresh', '#56B4E9'), ls='--')
+                else:
+                    self.ax_cs.axhline(params.get('CS_THRESHOLD_SIGMA', 6.0) * res.get('sigma_cs', 0.0), color=colors.get('cs_thresh', '#56B4E9'), ls='--')
+                if res.get('local_baseline', False) and 'ss_threshold_trace' in res:
+                    self.ax_ss.plot(t[mask], np.asarray(res['ss_threshold_trace'])[mask], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
+                else:
+                    self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 2.0) * res.get('sigma_ss', 0.0), color=colors.get('ss_thresh', '#CC79A7'), ls='--')
 
             cs_idx = np.asarray(res.get('cs_peaks', []), dtype=int)
             ss_idx = np.asarray(res.get('ss_peaks', []), dtype=int)
@@ -3418,9 +3585,13 @@ class DetectionViewerDialog(QtWidgets.QDialog):
         self.ax_ss_simple.plot(t[mask], ss_simple[mask], color=colors.get('ss_trace', '#D55E00'))
         cs_simple_thr = float(res.get('cs_simple_threshold_used', np.nan))
         ss_simple_thr = float(res.get('ss_simple_threshold_used', np.nan))
-        if np.isfinite(cs_simple_thr):
+        if res.get('simple_local_baseline', False) and 'cs_simple_threshold_trace' in res:
+            self.ax_cs_simple.plot(t[mask], np.asarray(res['cs_simple_threshold_trace'])[mask], color=colors.get('cs_thresh', '#56B4E9'), ls='--')
+        elif np.isfinite(cs_simple_thr):
             self.ax_cs_simple.axhline(cs_simple_thr, color=colors.get('cs_thresh', '#56B4E9'), ls='--')
-        if np.isfinite(ss_simple_thr):
+        if res.get('simple_local_baseline', False) and 'ss_simple_threshold_trace' in res:
+            self.ax_ss_simple.plot(t[mask], np.asarray(res['ss_simple_threshold_trace'])[mask], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
+        elif np.isfinite(ss_simple_thr):
             self.ax_ss_simple.axhline(ss_simple_thr, color=colors.get('ss_thresh', '#CC79A7'), ls='--')
 
         self.ax_raw_spikes.plot(t[mask], raw_proc[mask], color=colors.get('raw', '#333333'), lw=_get_linewidth(1))
@@ -4001,7 +4172,6 @@ class StatsViewerDialog(QtWidgets.QDialog):
                         items.append((res, sdata))
 
         # Now compute stats across collected items
-        window_ms = 100
         all_stats = {'CS': {'waves': [], 'snr': [], 'fwhm': []}, 'SS': {'waves': [], 'snr': [], 'fwhm': []}}
         rates = {'CS': [], 'SS': []}
         for res, sdata in items:
@@ -4013,15 +4183,16 @@ class StatsViewerDialog(QtWidgets.QDialog):
             except Exception:
                 fs = float(self.data.get('fs', 1000.0))
                 duration_s = np.nan
-            half_win = int((window_ms/2.0) * fs / 1000.0)
             for spike_type in ['CS', 'SS']:
                 try:
+                    window_ms_type = _stats_window_ms(spike_type)
+                    half_win = int((window_ms_type / 2.0) * fs / 1000.0)
                     peaks_key = 'cs_peaks' if spike_type == 'CS' else 'ss_peaks'
                     peaks = np.array(res.get(peaks_key, []), dtype=int)
                     if duration_s and duration_s > 0:
                         rates[spike_type].append(len(peaks) / duration_s)
                     # compute SNRs
-                    event_snrs = compute_event_snrs(res, spike_type, fs, window_ms=window_ms, max_per_cell=None)
+                    event_snrs = compute_event_snrs(res, spike_type, fs, window_ms=window_ms_type, max_per_cell=None)
                     if len(event_snrs) > 0:
                         all_stats[spike_type]['snr'].extend(event_snrs)
                     # collect waveforms and fwhm
@@ -4040,7 +4211,7 @@ class StatsViewerDialog(QtWidgets.QDialog):
                             wave = wave - np.mean(wave[:5])
                         all_stats[spike_type]['waves'].append(wave)
                         _, interp_wave = get_interpolated_wave(wave, fs)
-                        t_d = np.linspace(-window_ms/2.0, window_ms/2.0, len(interp_wave))
+                        t_d = np.linspace(-window_ms_type/2.0, window_ms_type/2.0, len(interp_wave))
                         _, fwhm = get_wave_stats(interp_wave, t_d)
                         if not np.isnan(fwhm):
                             all_stats[spike_type]['fwhm'].append(fwhm)
@@ -4056,7 +4227,8 @@ class StatsViewerDialog(QtWidgets.QDialog):
 
         # Plot: 2 rows x 4 cols (last col for text summary)
         self.fig.clf()
-        gs = self.fig.add_gridspec(2, 4, width_ratios=[2.0, 1.0, 1.0, 0.8], wspace=0.4, hspace=0.5)
+        # Make waveform panels narrower (30% narrower than previous 2.0 width ratio).
+        gs = self.fig.add_gridspec(2, 4, width_ratios=[1.0, 1.0, 1.0, 0.8], wspace=0.4, hspace=0.5)
         def _pick_color(d, keys, default):
             for k in keys:
                 try:
@@ -4077,17 +4249,44 @@ class StatsViewerDialog(QtWidgets.QDialog):
             else:
                 color = _pick_color(colors, ['ss_trace', 'ss'], '#D55E00')
 
-            # per-spike-type time window: CS=100ms, SS=30ms
-            w_ms = 100 if spike_type == 'CS' else 30
+            # per-spike-type time window: CS=100ms, SS=50ms
+            w_ms = _stats_window_ms(spike_type)
 
             ax1 = self.fig.add_subplot(gs[row, 0])
+            mean_wave = None
+            std_wave = None
             if len(waves) > 0:
+                wave_list = [np.asarray(w, dtype=float).ravel() for w in waves if np.asarray(w).size > 0]
+                wave_list = [w for w in wave_list if np.all(np.isfinite(w))]
                 max_bg = min(len(waves), 2000)
                 # Use different background-alpha for CS vs SS to control trace visibility
                 bg_alpha = 0.3 if spike_type == 'CS' else 0.003
-                for w in waves[:max_bg]:
+                for w in wave_list[:max_bg]:
                     ax1.plot(np.linspace(-w_ms/2.0, w_ms/2.0, len(w)), w, color=color, alpha=bg_alpha, lw=_get_linewidth(0.5))
-                ax1.plot(np.linspace(-w_ms/2.0, w_ms/2.0, len(waves[0])), np.mean(waves, axis=0), color=color, lw=_get_linewidth(3))
+                if len(wave_list) > 0:
+                    min_len = int(min([len(w) for w in wave_list]))
+                    if min_len > 1:
+                        stack = np.vstack([w[:min_len] for w in wave_list])
+                        mean_wave = np.mean(stack, axis=0)
+                        std_wave = np.std(stack, axis=0)
+                        ax1.plot(np.linspace(-w_ms/2.0, w_ms/2.0, min_len), mean_wave, color=color, lw=_get_linewidth(3))
+            # Keep y=0 anchored by the mean waveform envelope instead of outlier traces.
+            if mean_wave is not None and std_wave is not None and len(mean_wave) > 1:
+                try:
+                    y_low = float(np.nanmin(mean_wave - 2.0 * std_wave))
+                    y_high = float(np.nanmax(mean_wave + 2.0 * std_wave))
+                    if np.isfinite(y_low) and np.isfinite(y_high) and y_high > y_low:
+                        pad = 0.08 * (y_high - y_low)
+                        y_low -= pad
+                        y_high += pad
+                        if y_low > 0.0:
+                            y_low = -pad
+                        if y_high < 0.0:
+                            y_high = pad
+                        ax1.set_ylim(y_low, y_high)
+                except Exception:
+                    pass
+            ax1.axhline(0.0, color='0.5', lw=_get_linewidth(0.8), alpha=0.6, zorder=1)
             ax1.set_title(f"{spike_type} Waveforms")
             ax1.set_xlabel('ms')
             try:
@@ -4101,8 +4300,17 @@ class StatsViewerDialog(QtWidgets.QDialog):
 
             ax2 = self.fig.add_subplot(gs[row, 1])
             if len(fwhm) > 0:
-                ax2.hist(fwhm, bins=20, color=color, alpha=0.8)
+                fwhm_arr = np.asarray(fwhm, dtype=float)
+                fwhm_arr = fwhm_arr[np.isfinite(fwhm_arr)]
+                ax2.hist(fwhm_arr, bins=20, color=color, alpha=0.8)
                 ax2.set_title('FWHM')
+                if fwhm_arr.size > 0:
+                    lo = max(0.0, float(np.nanmin(fwhm_arr)) * 0.95)
+                    hi = float(np.nanmax(fwhm_arr)) * 1.05
+                    if hi > lo:
+                        ax2.set_xlim(lo, hi)
+            ax2.set_xlabel('FWHM (ms)')
+            ax2.set_ylabel('Count')
             try:
                 ax2.spines['top'].set_visible(False)
             except Exception:
@@ -4116,8 +4324,17 @@ class StatsViewerDialog(QtWidgets.QDialog):
 
             ax3 = self.fig.add_subplot(gs[row, 2])
             if len(snr) > 0:
-                ax3.hist(snr, bins=20, color=color, alpha=0.8)
+                snr_arr = np.asarray(snr, dtype=float)
+                snr_arr = snr_arr[np.isfinite(snr_arr)]
+                ax3.hist(snr_arr, bins=20, color=color, alpha=0.8)
                 ax3.set_title('SNR')
+                if snr_arr.size > 0:
+                    lo = max(0.0, float(np.nanmin(snr_arr)) * 0.95)
+                    hi = float(np.nanmax(snr_arr)) * 1.05
+                    if hi > lo:
+                        ax3.set_xlim(lo, hi)
+            ax3.set_xlabel('SNR')
+            ax3.set_ylabel('Count')
             try:
                 ax3.spines['top'].set_visible(False)
             except Exception:

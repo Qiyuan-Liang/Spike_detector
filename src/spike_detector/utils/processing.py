@@ -22,6 +22,33 @@ def estimate_noise_mad(trace):
     return 1e-6
 
 
+def estimate_noise_mad_local(trace, window_samples):
+    """Compute a local MAD-based noise estimate using a sliding window.
+
+    Returns an array of the same length as *trace* where each element is the
+    MAD (scaled to normal) computed within a centred window of
+    *window_samples*.  Uses a fast rolling-median approach for efficiency.
+    """
+    from scipy.ndimage import median_filter
+    n = len(trace)
+    if window_samples < 5:
+        window_samples = 5
+    if window_samples > n:
+        window_samples = n
+    # Ensure odd window for symmetry
+    if window_samples % 2 == 0:
+        window_samples += 1
+    local_median = median_filter(trace, size=window_samples, mode='reflect')
+    abs_dev = np.abs(trace - local_median)
+    local_mad = median_filter(abs_dev, size=window_samples, mode='reflect')
+    # Scale factor for MAD → σ (normal distribution)
+    scale = 1.4826
+    out = local_mad * scale
+    # Ensure a minimum floor to avoid zero-threshold
+    out[out < 1e-9] = 1e-9
+    return out
+
+
 def detrend_trace(trace, fs, window_sec=0.05, percentile=20):
     window_samples = int(window_sec * fs)
     if window_samples < 5:
@@ -541,7 +568,9 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
                         ss_low_cut=50.0, ss_high_cut=700.0, ss_thresh_sigma=2.0,
                         ss_min_dist_ms=2, ss_blank_ms=8, ss_min_width_ms=1, ss_max_width_ms=6,
                         use_preprocessed=False, pre_detrended=None, pre_baseline=None,
-                        initial_blank_ms=0.0, cs_order=3, ss_order=3):
+                        initial_blank_ms=0.0, cs_order=3, ss_order=3,
+                        local_baseline=False, local_baseline_cs_ms=200.0,
+                        local_baseline_ss_ms=50.0):
     working = raw_trace * -1 if negative_going else raw_trace
     if use_preprocessed and pre_detrended is not None and pre_baseline is not None:
         detrended = pre_detrended
@@ -565,7 +594,19 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
     cs_dist = int((cs_min_dist_ms / 1000.0) * fs)
     if cs_dist < 1:
         cs_dist = 1
-    cs_candidates, _ = find_peaks(cs_trace, height=cs_thresh_sigma * sigma_cs, distance=cs_dist)
+
+    # CS threshold: local or global
+    if local_baseline:
+        cs_win_samples = max(5, int((local_baseline_cs_ms / 1000.0) * fs))
+        cs_local_sigma = estimate_noise_mad_local(cs_trace, cs_win_samples)
+        cs_threshold_trace = cs_thresh_sigma * cs_local_sigma
+        cs_candidates, _ = find_peaks(cs_trace, distance=cs_dist)
+        # filter by local threshold
+        cs_candidates = cs_candidates[cs_trace[cs_candidates] >= cs_threshold_trace[cs_candidates]]
+    else:
+        cs_threshold_trace = None
+        cs_candidates, _ = find_peaks(cs_trace, height=cs_thresh_sigma * sigma_cs, distance=cs_dist)
+
     if initial_blank_ms is not None and initial_blank_ms > 0:
         init_blank_samples = int((initial_blank_ms / 1000.0) * fs)
         cs_peaks = cs_candidates[cs_candidates >= init_blank_samples]
@@ -590,19 +631,35 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
         sigma_ss_filtered = estimate_noise_mad(ss_trace_clean)
     ss_dist = int((ss_min_dist_ms / 1000.0) * fs)
     ss_dist = max(1, ss_dist)
-    w_min = (ss_min_width_ms / 1000.0) * fs
-    w_max = (ss_max_width_ms / 1000.0) * fs
-    try:
-        ss_candidates, _ = find_peaks(ss_trace_clean, height=ss_thresh_sigma * sigma_ss_filtered, distance=ss_dist, width=(w_min, w_max), rel_height=0.5)
-    except Exception:
-        ss_candidates = np.array([], dtype=int)
+
+    # SS threshold: local or global
+    if local_baseline:
+        ss_win_samples = max(5, int((local_baseline_ss_ms / 1000.0) * fs))
+        ss_local_sigma = estimate_noise_mad_local(ss_trace_clean, ss_win_samples)
+        ss_threshold_trace = ss_thresh_sigma * ss_local_sigma
+        try:
+            ss_candidates, _ = find_peaks(ss_trace_clean, distance=ss_dist)
+            ss_candidates = ss_candidates[ss_trace_clean[ss_candidates] >= ss_threshold_trace[ss_candidates]]
+        except Exception:
+            ss_candidates = np.array([], dtype=int)
+    else:
+        ss_threshold_trace = None
+        try:
+            ss_candidates, _ = find_peaks(
+                ss_trace_clean,
+                height=ss_thresh_sigma * sigma_ss_filtered,
+                distance=ss_dist,
+            )
+        except Exception:
+            ss_candidates = np.array([], dtype=int)
+
     if initial_blank_ms is not None and initial_blank_ms > 0:
         init_blank_samples = int((initial_blank_ms / 1000.0) * fs)
         ss_peaks = ss_candidates[ss_candidates >= init_blank_samples]
     else:
         ss_peaks = ss_candidates
 
-    return {
+    result = {
         'detrended': detrended,
         'baseline': baseline,
         'cs_trace': cs_trace,
@@ -613,10 +670,20 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
         'sigma_ss': sigma_ss_filtered,
         'raw_sigma': global_sigma,
         'det_method': 'Threshold',
-        'threshold_mode': 'Sigma x MAD',
+        'threshold_mode': 'Sigma x MAD (local)' if local_baseline else 'Sigma x MAD',
         'cs_threshold_used': float(cs_thresh_sigma * sigma_cs),
         'ss_threshold_used': float(ss_thresh_sigma * sigma_ss_filtered),
+        'local_baseline': bool(local_baseline),
+        'ss_width_filter_enabled': False,
+        'ss_min_dist_ms_used': float(ss_min_dist_ms),
+        'ss_blank_ms_used': float(ss_blank_ms),
+        'initial_blank_ms_used': float(initial_blank_ms) if initial_blank_ms is not None else 0.0,
     }
+    if cs_threshold_trace is not None:
+        result['cs_threshold_trace'] = cs_threshold_trace
+    if ss_threshold_trace is not None:
+        result['ss_threshold_trace'] = ss_threshold_trace
+    return result
 
 
 def get_interpolated_wave(wave, fs, upscale_factor=10):

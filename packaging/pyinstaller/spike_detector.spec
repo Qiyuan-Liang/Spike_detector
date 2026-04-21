@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
+import sys
 
 block_cipher = None
 
@@ -17,7 +18,12 @@ hiddenimports = [
 datas = []
 datas += collect_data_files('matplotlib', include_py_files=False)
 
-ROOT = Path(__file__).resolve().parents[2]
+if '__file__' in globals():
+    ROOT = Path(__file__).resolve().parents[2]
+elif '__spec__' in globals() and getattr(__spec__, 'origin', None):
+    ROOT = Path(__spec__.origin).resolve().parents[2]
+else:
+    ROOT = Path.cwd().resolve()
 
 a = Analysis(
     [str(ROOT / 'gui_preprocess_V3.3.py')],
