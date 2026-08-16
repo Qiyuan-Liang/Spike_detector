@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spike-detector-gui"
-version = "3.3.0"
+version = "3.5.41"
 description = "GUI spike detector for CS/SS activity in Purkinje neurons"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,8 @@ dependencies = [
   "scipy",
   "pandas",
   "matplotlib",
+  "PyWavelets",
+  "scikit-learn",
   "PyQt6",
   "openpyxl",
 ]

@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, find_peaks, fftconvolve
+from scipy.signal import butter, sosfiltfilt, find_peaks, fftconvolve, peak_widths
 from scipy.ndimage import percentile_filter
 from scipy.stats import median_abs_deviation
 
@@ -63,13 +63,20 @@ def butter_bandpass(lowcut, highcut, fs, order=3):
         return None
 
     def _norm(val):
-        return None if val is None else float(val) / float(nyq)
+        if val is None:
+            return None
+        try:
+            v = float(val)
+        except Exception:
+            return None
+        if not np.isfinite(v) or v <= 0.0:
+            return None
+        return v / float(nyq)
 
     low_n = _norm(lowcut)
     high_n = _norm(highcut)
-    eps = 1e-6
-    if low_n is not None and low_n <= 0.0:
-        low_n = eps
+    if low_n is None and high_n is None:
+        return None
     if high_n is not None and high_n >= 1.0:
         high_n = 1.0 - 1e-3
     if low_n is not None and high_n is not None and low_n >= high_n:
@@ -392,16 +399,43 @@ def _filter_peaks_by_reference(peaks, ref_peaks, tol_samples):
     return np.asarray(sorted(set(keep)), dtype=int)
 
 
+def _filter_peaks_min_fwhm(signal, peaks, fs_hz, min_fwhm_ms):
+    p = np.asarray(peaks, dtype=int).ravel()
+    if p.size == 0:
+        return np.array([], dtype=int)
+    try:
+        min_ms = float(min_fwhm_ms)
+    except Exception:
+        return np.sort(np.unique(p))
+    try:
+        fs_val = float(fs_hz)
+    except Exception:
+        fs_val = np.nan
+    if (not np.isfinite(min_ms)) or min_ms <= 0 or (not np.isfinite(fs_val)) or fs_val <= 0:
+        return np.sort(np.unique(p))
+    try:
+        widths_samples, _, _, _ = peak_widths(np.asarray(signal, dtype=float), p, rel_height=0.5)
+        fwhm_ms = (widths_samples / fs_val) * 1000.0
+        keep = p[fwhm_ms > min_ms]
+        if keep.size == 0:
+            return np.array([], dtype=int)
+        return np.asarray(sorted(set(keep.tolist())), dtype=int)
+    except Exception:
+        return np.sort(np.unique(p))
+
+
 def process_cell_template_matching(raw_trace, fs,
                                    template_cs_bank=None, template_ss_bank=None,
                                    template_cs_fs_bank=None, template_ss_fs_bank=None,
                                    negative_going=True,
-                                   cs_high_cut=150.0, cs_thresh_sigma=6.0, cs_min_dist_ms=25,
-                                   ss_low_cut=50.0, ss_high_cut=700.0, ss_thresh_sigma=2.0,
-                                   ss_min_dist_ms=2, ss_blank_ms=8,
+                                   cs_low_cut=0.0, cs_high_cut=150.0, cs_thresh_sigma=6.0, cs_min_dist_ms=25,
+                                   cs_min_fwhm_ms=4.0,
+                                   ss_low_cut=0.0, ss_high_cut=0.0, ss_thresh_sigma=2.5,
+                                   ss_min_dist_ms=2, ss_blank_ms=15,
                                    template_match_method='LLR Probability Vector',
                                    parallel_match=False,
                                    use_preprocessed=False, pre_detrended=None, pre_baseline=None,
+                                   pre_detrended_cs=None, pre_detrended_ss=None,
                                    initial_blank_ms=0.0, cs_order=3, ss_order=3):
     working = raw_trace * -1 if negative_going else raw_trace
     if use_preprocessed and pre_detrended is not None and pre_baseline is not None:
@@ -411,11 +445,13 @@ def process_cell_template_matching(raw_trace, fs,
         detrended, baseline = detrend_trace(working, fs, window_sec=0.05, percentile=20)
 
     detr_for_detection = detrended
+    detr_for_detection_cs = np.asarray(pre_detrended_cs, dtype=float) if pre_detrended_cs is not None else detr_for_detection
+    detr_for_detection_ss = np.asarray(pre_detrended_ss, dtype=float) if pre_detrended_ss is not None else detr_for_detection
 
     global_sigma = estimate_noise_mad(detrended)
 
     sim_fs = float(max(float(fs), TEMPLATE_TARGET_FS))
-    cs_base = apply_filter(detr_for_detection, fs, low=None, high=cs_high_cut, order=cs_order)
+    cs_base = apply_filter(detr_for_detection_cs, fs, low=cs_low_cut, high=cs_high_cut, order=cs_order)
     cs_base_sim = _resample_trace_to_fs(cs_base, fs, sim_fs)
     if bool(parallel_match):
         cs_banks = _build_parallel_template_banks(template_cs_bank, template_cs_fs_bank, sim_fs,
@@ -465,6 +501,7 @@ def process_cell_template_matching(raw_trace, fs,
     else:
         cs_threshold_used = np.nan
         cs_candidates_sim = np.array([], dtype=int)
+    cs_candidates_sim = _filter_peaks_min_fwhm(cs_trace_sim, cs_candidates_sim, sim_fs, cs_min_fwhm_ms)
     if initial_blank_ms is not None and initial_blank_ms > 0:
         init_blank_samples = int((initial_blank_ms / 1000.0) * sim_fs)
         cs_candidates_sim = cs_candidates_sim[cs_candidates_sim >= init_blank_samples]
@@ -473,7 +510,7 @@ def process_cell_template_matching(raw_trace, fs,
     else:
         cs_peaks = np.array([], dtype=int)
 
-    ss_base = apply_filter(detr_for_detection, fs, low=ss_low_cut, high=ss_high_cut, order=ss_order)
+    ss_base = apply_filter(detr_for_detection_ss, fs, low=ss_low_cut, high=ss_high_cut, order=ss_order)
     ss_base_sim = _resample_trace_to_fs(ss_base, fs, sim_fs)
     ss_base_clean_sim = ss_base_sim.copy()
     blank_samples = max(0, int((ss_blank_ms / 1000.0) * sim_fs))
@@ -556,6 +593,7 @@ def process_cell_template_matching(raw_trace, fs,
         'det_method': f'Template Matching ({template_match_method})',
         'threshold_mode': 'Sigma x MAD',
         'parallel_match': bool(parallel_match),
+        'cs_min_fwhm_ms_used': float(cs_min_fwhm_ms),
         'cs_threshold_used': cs_threshold_used,
         'ss_threshold_used': ss_threshold_used,
         'cs_similarity_trace': cs_similarity_trace,
@@ -564,10 +602,12 @@ def process_cell_template_matching(raw_trace, fs,
 
 
 def process_cell_simple(raw_trace, fs, negative_going=True,
-                        cs_high_cut=150.0, cs_thresh_sigma=6.0, cs_min_dist_ms=25,
-                        ss_low_cut=50.0, ss_high_cut=700.0, ss_thresh_sigma=2.0,
-                        ss_min_dist_ms=2, ss_blank_ms=8, ss_min_width_ms=1, ss_max_width_ms=6,
+                        cs_low_cut=0.0, cs_high_cut=150.0, cs_thresh_sigma=6.0, cs_min_dist_ms=25,
+                        cs_min_fwhm_ms=4.0,
+                        ss_low_cut=0.0, ss_high_cut=0.0, ss_thresh_sigma=2.5,
+                        ss_min_dist_ms=2, ss_blank_ms=15, ss_min_width_ms=1, ss_max_width_ms=6,
                         use_preprocessed=False, pre_detrended=None, pre_baseline=None,
+                        pre_detrended_cs=None, pre_detrended_ss=None,
                         initial_blank_ms=0.0, cs_order=3, ss_order=3,
                         local_baseline=False, local_baseline_cs_ms=200.0,
                         local_baseline_ss_ms=50.0):
@@ -587,9 +627,11 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
                 detr_for_detection = detrended
     except Exception:
         detr_for_detection = detrended
+    detr_for_detection_cs = np.asarray(pre_detrended_cs, dtype=float) if pre_detrended_cs is not None else detr_for_detection
+    detr_for_detection_ss = np.asarray(pre_detrended_ss, dtype=float) if pre_detrended_ss is not None else detr_for_detection
     global_sigma = estimate_noise_mad(detrended)
 
-    cs_trace = apply_filter(detr_for_detection, fs, low=None, high=cs_high_cut, order=cs_order)
+    cs_trace = apply_filter(detr_for_detection_cs, fs, low=cs_low_cut, high=cs_high_cut, order=cs_order)
     sigma_cs = estimate_noise_mad(cs_trace)
     cs_dist = int((cs_min_dist_ms / 1000.0) * fs)
     if cs_dist < 1:
@@ -607,13 +649,15 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
         cs_threshold_trace = None
         cs_candidates, _ = find_peaks(cs_trace, height=cs_thresh_sigma * sigma_cs, distance=cs_dist)
 
+    cs_candidates = _filter_peaks_min_fwhm(cs_trace, cs_candidates, fs, cs_min_fwhm_ms)
+
     if initial_blank_ms is not None and initial_blank_ms > 0:
         init_blank_samples = int((initial_blank_ms / 1000.0) * fs)
         cs_peaks = cs_candidates[cs_candidates >= init_blank_samples]
     else:
         cs_peaks = cs_candidates
 
-    ss_trace = apply_filter(detr_for_detection, fs, low=ss_low_cut, high=ss_high_cut, order=ss_order)
+    ss_trace = apply_filter(detr_for_detection_ss, fs, low=ss_low_cut, high=ss_high_cut, order=ss_order)
     ss_trace_clean = ss_trace.copy()
     blank_samples = int((ss_blank_ms / 1000.0) * fs)
     for cs_idx in cs_peaks:
@@ -671,6 +715,7 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
         'raw_sigma': global_sigma,
         'det_method': 'Threshold',
         'threshold_mode': 'Sigma x MAD (local)' if local_baseline else 'Sigma x MAD',
+        'cs_min_fwhm_ms_used': float(cs_min_fwhm_ms),
         'cs_threshold_used': float(cs_thresh_sigma * sigma_cs),
         'ss_threshold_used': float(ss_thresh_sigma * sigma_ss_filtered),
         'local_baseline': bool(local_baseline),
@@ -702,17 +747,62 @@ def get_interpolated_wave(wave, fs, upscale_factor=10):
 def get_wave_stats(wave, time_axis_ms):
     if len(wave) == 0:
         return np.nan, np.nan
-    peak_idx = int(np.argmax(wave))
-    baseline = np.mean(wave[:5]) if len(wave) > 5 else 0.0
-    amp = wave[peak_idx] - baseline
-    half_height = baseline + (amp / 2.0)
-    crossings = np.where(np.diff(np.sign(wave - half_height)))[0]
+    arr = np.asarray(wave, dtype=float).ravel()
+    tx = np.asarray(time_axis_ms, dtype=float).ravel()
+    if arr.size == 0 or tx.size != arr.size:
+        return np.nan, np.nan
+    finite = np.isfinite(arr) & np.isfinite(tx)
+    if not np.any(finite):
+        return np.nan, np.nan
+    arr = arr[finite]
+    tx = tx[finite]
+    if arr.size == 0:
+        return np.nan, np.nan
+    peak_idx = int(np.nanargmax(arr))
+    n_base = max(5, int(round(0.10 * arr.size)))
+    n_base = min(n_base, max(1, peak_idx)) if peak_idx > 0 else min(n_base, arr.size)
+    baseline = float(np.nanmedian(arr[:n_base])) if n_base > 0 else 0.0
+    y = arr - baseline
+    amp = float(y[peak_idx])
+    if not np.isfinite(amp) or amp <= 0:
+        return amp, np.nan
+    half_height = 0.5 * amp
+
+    def _cross_time(i0, i1):
+        y0 = float(y[i0] - half_height)
+        y1 = float(y[i1] - half_height)
+        t0 = float(tx[i0])
+        t1 = float(tx[i1])
+        denom = y1 - y0
+        if not np.isfinite(denom) or abs(denom) < 1e-12:
+            return t0
+        frac = float(np.clip(-y0 / denom, 0.0, 1.0))
+        return t0 + frac * (t1 - t0)
+
+    left_t = np.nan
+    for i in range(peak_idx - 1, -1, -1):
+        if y[i] <= half_height <= y[i + 1]:
+            left_t = _cross_time(i, i + 1)
+            break
+    right_t = np.nan
+    for i in range(peak_idx, arr.size - 1):
+        if y[i] >= half_height >= y[i + 1]:
+            right_t = _cross_time(i, i + 1)
+            break
     fwhm = np.nan
-    if len(crossings) >= 2:
-        left = crossings[crossings < peak_idx]
-        right = crossings[crossings >= peak_idx]
-        if len(left) > 0 and len(right) > 0:
-            fwhm = time_axis_ms[right[0]] - time_axis_ms[left[-1]]
+    if np.isfinite(left_t) and np.isfinite(right_t) and right_t > left_t:
+        fwhm = float(right_t - left_t)
+    else:
+        try:
+            widths, _, left_ips, right_ips = peak_widths(y, [peak_idx], rel_height=0.5)
+            if widths.size > 0 and np.isfinite(widths[0]) and widths[0] > 0:
+                sample_axis = np.arange(arr.size, dtype=float)
+                lt = float(np.interp(float(left_ips[0]), sample_axis, tx))
+                rt = float(np.interp(float(right_ips[0]), sample_axis, tx))
+                if rt > lt:
+                    fwhm = rt - lt
+        except Exception:
+            pass
     return amp, fwhm
 
 
@@ -738,41 +828,130 @@ def _select_event_bank(peaks, max_per_cell=None):
             return np.array([], dtype=int)
 
 
-def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_cell=None):
+def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_cell=None, trace_override=None):
+    """Compute per-event SNR using robust local noise windows with spike masking.
+
+    Parameters kept for compatibility:
+    - window_ms is currently unused by design (type-specific windows are fixed).
+    - trace_override allows callers to enforce a unified waveform source trace.
+    """
     snr_list = []
     if res is None:
         return snr_list
-    try:
-        half_win = int((window_ms / 2.0) * fs / 1000.0)
-        if spike_type == 'CS':
-            peaks = np.array(res.get('cs_peaks', []), dtype=int)
-            trace = res.get('cs_trace', None)
-            sigma = float(res.get('sigma_cs', 1.0))
-        else:
-            peaks = np.array(res.get('ss_peaks', []), dtype=int)
-            trace = res.get('ss_trace', None)
-            if trace is None:
-                trace = res.get('detrended', None)
-            sigma = float(res.get('raw_sigma', 1.0))
 
-        if trace is None or peaks.size == 0:
+    def _ms_to_samples(ms):
+        try:
+            return int(max(1, round(float(ms) * float(fs) / 1000.0)))
+        except Exception:
+            return 1
+
+    def _robust_sigma(arr):
+        x = np.asarray(arr, dtype=float).ravel()
+        if x.size <= 0:
+            return np.nan
+        x = x[np.isfinite(x)]
+        if x.size <= 0:
+            return np.nan
+        med = float(np.median(x))
+        mad = float(np.median(np.abs(x - med)))
+        sig = 1.4826 * mad
+        return sig if np.isfinite(sig) and sig > 0 else np.nan
+
+    def _mark_exclusion(mask, peak_arr, pre_ms, post_ms, n_total):
+        pks = np.asarray(peak_arr, dtype=int).ravel()
+        if pks.size <= 0:
+            return
+        pre = _ms_to_samples(abs(pre_ms))
+        post = _ms_to_samples(abs(post_ms))
+        for q in pks:
+            if not np.isfinite(q):
+                continue
+            qq = int(q)
+            s = max(0, qq - pre)
+            e = min(n_total, qq + post + 1)
+            if e > s:
+                mask[s:e] = False
+
+    try:
+        st = str(spike_type).upper()
+        ss_peaks = np.array(res.get('ss_peaks', []), dtype=int)
+        cs_peaks = np.array(res.get('cs_peaks', []), dtype=int)
+        peaks = cs_peaks if st == 'CS' else ss_peaks
+
+        if trace_override is not None:
+            trace = np.asarray(trace_override, dtype=float).ravel()
+        elif st == 'CS':
+            trace = np.asarray(res.get('cs_trace', np.array([])), dtype=float).ravel()
+        else:
+            trace = np.asarray(res.get('ss_trace', res.get('detrended', np.array([]))), dtype=float).ravel()
+
+        if trace.size <= 0 or peaks.size == 0:
+            return snr_list
+
+        n = int(trace.size)
+        non_spike_mask = np.ones(n, dtype=bool)
+        if st == 'SS':
+            _mark_exclusion(non_spike_mask, ss_peaks, pre_ms=2.0, post_ms=4.0, n_total=n)
+            _mark_exclusion(non_spike_mask, cs_peaks, pre_ms=8.0, post_ms=30.0, n_total=n)
+            base_pre_ms, base_post_ms = 5.0, 1.0
+            noise_pre_ms, noise_post_ms = 50.0, 5.0
+        else:
+            _mark_exclusion(non_spike_mask, ss_peaks, pre_ms=3.0, post_ms=5.0, n_total=n)
+            _mark_exclusion(non_spike_mask, cs_peaks, pre_ms=20.0, post_ms=80.0, n_total=n)
+            base_pre_ms, base_post_ms = 20.0, 5.0
+            noise_pre_ms, noise_post_ms = 150.0, 20.0
+
+        global_sigma = _robust_sigma(trace[non_spike_mask])
+        if not np.isfinite(global_sigma) or global_sigma <= 0:
+            global_sigma = _robust_sigma(trace)
+        if not np.isfinite(global_sigma) or global_sigma <= 0:
             return snr_list
 
         chosen = _select_event_bank(peaks, max_per_cell=max_per_cell)
+        base_pre = _ms_to_samples(base_pre_ms)
+        base_post = _ms_to_samples(base_post_ms)
+        noise_pre = _ms_to_samples(noise_pre_ms)
+        noise_post = _ms_to_samples(noise_post_ms)
+        min_clean = max(20, _ms_to_samples(5.0))
+
         for p in chosen:
-            s = int(p - half_win)
-            e = int(p + half_win)
-            if s < 0 or e >= len(trace):
+            pi = int(p)
+            if pi < 0 or pi >= n:
                 continue
-            wave = trace[s:e]
-            if len(wave) != (2 * half_win):
+
+            b0 = max(0, pi - base_pre)
+            b1 = max(0, pi - base_post)
+            if b1 <= b0:
                 continue
-            baseline = np.mean(wave[:5]) if len(wave) > 5 else 0.0
-            amp = float(np.max(np.abs(wave - baseline)))
-            if sigma == 0:
+            baseline_seg = trace[b0:b1]
+            if baseline_seg.size <= 0:
                 continue
-            snr = amp / float(sigma)
-            snr_list.append(snr)
+            baseline_i = float(np.median(baseline_seg[np.isfinite(baseline_seg)])) if np.any(np.isfinite(baseline_seg)) else np.nan
+            if not np.isfinite(baseline_i):
+                continue
+            amplitude_i = float(trace[pi] - baseline_i)
+
+            n0 = max(0, pi - noise_pre)
+            n1 = max(0, pi - noise_post)
+            if n1 <= n0:
+                continue
+            local_vals = trace[n0:n1]
+            local_mask = non_spike_mask[n0:n1]
+            x_clean = local_vals[local_mask]
+            x_clean = x_clean[np.isfinite(x_clean)]
+
+            if x_clean.size >= min_clean:
+                sigma_i = _robust_sigma(x_clean)
+            else:
+                sigma_i = np.nan
+            if not np.isfinite(sigma_i) or sigma_i <= 0:
+                sigma_i = float(global_sigma)
+            if not np.isfinite(sigma_i) or sigma_i <= 0:
+                continue
+
+            snr_i = amplitude_i / sigma_i
+            if np.isfinite(snr_i):
+                snr_list.append(float(snr_i))
     except Exception:
         pass
     return snr_list
