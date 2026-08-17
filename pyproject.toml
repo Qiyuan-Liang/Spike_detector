@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spike-detector-gui"
-version = "3.5.41"
+version = "3.5.45"
 description = "GUI spike detector for CS/SS activity in Purkinje neurons"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -19,8 +19,8 @@ Read this file before making repository changes. Keep long change history in `LO
 - Use `rg` for repository searches and keep changes scoped to the requested analysis/GUI behavior.
 - Update `LOG.md` whenever changing repository behavior.
 - Maintain the spike detector version in real time in the GUI title, `pyproject.toml`, and `LOG.md`.
-- Current version after this revision is `3.5.41`.
-- For later patch revisions in this series, increment only the patch version: `3.5.42`, `3.5.43`, and so on.
+- Current version after this revision is `3.5.45`.
+- For later patch revisions in this series, increment only the patch version: `3.5.46`, `3.5.47`, and so on.
 - Do not change the minor or major version line yourself. Only move to versions such as `3.6` or `4.0` when the user explicitly asks.
 
 ## Change Log Location

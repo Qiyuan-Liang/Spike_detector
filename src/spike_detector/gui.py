@@ -62,7 +62,7 @@ from .utils.session import load_session_path
 from .utils.export import save_figure_with_dialog
 from .utils.stats import mean_std_count
 
-APP_VERSION = '3.5.41'
+APP_VERSION = '3.5.45'
 
 # Orientation compatibility helper (works across PyQt6 / PySide6)
 try:
@@ -2399,27 +2399,31 @@ class MainWindow(QtWidgets.QMainWindow):
             # dialog updates parent.params and parent.colors directly
             self.update_plot()
 
+    def _current_settings_snapshot(self):
+        self._sync_detection_controls_to_params()
+        return {
+            'version': 1,
+            'app_version': APP_VERSION,
+            'params': dict(self.params),
+            'baseline_params': dict(self.baseline_params),
+            'colors': dict(self.colors),
+            'ui': {
+                'window_ms': float(self.spin_window.value()) if hasattr(self, 'spin_window') else 500.0,
+                'y_range': float(self.spin_zoom.value()) if hasattr(self, 'spin_zoom') else 0.0,
+                'avg_frames': int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0,
+                'baseline_method': str(self.combo_baseline_method.currentText()) if hasattr(self, 'combo_baseline_method') else self.baseline_params.get('method', 'Median'),
+                'baseline_window_ms': float(self.spin_baseline_window.value()) if hasattr(self, 'spin_baseline_window') else self.baseline_params.get('window_ms', 30.0),
+                'baseline_percentile': float(self.spin_baseline_percentile.value()) if hasattr(self, 'spin_baseline_percentile') else self.baseline_params.get('percentile', 20.0),
+                'show_baseline': bool(self.chk_show_baseline.isChecked()) if hasattr(self, 'chk_show_baseline') else False,
+                'show_cs': bool(self.chk_show_cs.isChecked()) if hasattr(self, 'chk_show_cs') else False,
+                'show_ss': bool(self.chk_show_ss.isChecked()) if hasattr(self, 'chk_show_ss') else False,
+                'detection_tab_index': int(self.tabs_detection.currentIndex()) if hasattr(self, 'tabs_detection') else 0,
+            },
+        }
+
     def save_all_settings(self):
         try:
-            self._sync_detection_controls_to_params()
-            cfg = {
-                'version': 1,
-                'params': dict(self.params),
-                'baseline_params': dict(self.baseline_params),
-                'colors': dict(self.colors),
-                'ui': {
-                    'window_ms': float(self.spin_window.value()) if hasattr(self, 'spin_window') else 500.0,
-                    'y_range': float(self.spin_zoom.value()) if hasattr(self, 'spin_zoom') else 0.0,
-                    'avg_frames': int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0,
-                    'baseline_method': str(self.combo_baseline_method.currentText()) if hasattr(self, 'combo_baseline_method') else self.baseline_params.get('method', 'Median'),
-                    'baseline_window_ms': float(self.spin_baseline_window.value()) if hasattr(self, 'spin_baseline_window') else self.baseline_params.get('window_ms', 30.0),
-                    'baseline_percentile': float(self.spin_baseline_percentile.value()) if hasattr(self, 'spin_baseline_percentile') else self.baseline_params.get('percentile', 20.0),
-                    'show_baseline': bool(self.chk_show_baseline.isChecked()) if hasattr(self, 'chk_show_baseline') else False,
-                    'show_cs': bool(self.chk_show_cs.isChecked()) if hasattr(self, 'chk_show_cs') else False,
-                    'show_ss': bool(self.chk_show_ss.isChecked()) if hasattr(self, 'chk_show_ss') else False,
-                    'detection_tab_index': int(self.tabs_detection.currentIndex()) if hasattr(self, 'tabs_detection') else 0,
-                },
-            }
+            cfg = self._current_settings_snapshot()
             filename, _ = QFileDialog.getSaveFileName(self, 'Save settings', os.path.expanduser('~/spike_detector_settings.json'), 'JSON Files (*.json)')
             if not filename:
                 return
@@ -3053,7 +3057,17 @@ class MainWindow(QtWidgets.QMainWindow):
                                             analysis_settings_json=json.dumps(analysis_settings),
                                             baseline_params_json=json.dumps(dict(self.baseline_params)),
                                             detection_params_json=json.dumps(dict(self.params)))
+                        settings_target = os.path.splitext(save_target)[0] + '_settings.json'
+                        settings_snapshot = self._current_settings_snapshot()
+                        settings_snapshot.update({
+                            'settings_kind': 'spike_detection_sidecar',
+                            'results_file': os.path.basename(save_target),
+                            'analysis_settings': analysis_settings,
+                        })
+                        with open(settings_target, 'w', encoding='utf-8') as f:
+                            json.dump(settings_snapshot, f, indent=2)
                         data['results_file'] = save_target
+                        data['settings_file'] = settings_target
                         if use_temp_file:
                             n_saved_temp += 1
                         else:
