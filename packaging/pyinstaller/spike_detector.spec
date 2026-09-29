@@ -1,60 +1,52 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""Windows one-folder GUI build. Invoke from the extracted bundle root."""
 
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
-import sys
 
-block_cipher = None
+ROOT = Path(SPEC).resolve().parents[2]
 
-hiddenimports = [
-    'PyQt6',
-    'PyQt6.QtCore',
-    'PyQt6.QtGui',
-    'PyQt6.QtWidgets',
-    'matplotlib.backends.backend_qtagg',
-    'openpyxl',
-]
-
-datas = []
-datas += collect_data_files('matplotlib', include_py_files=False)
-
-if '__file__' in globals():
-    ROOT = Path(__file__).resolve().parents[2]
-elif '__spec__' in globals() and getattr(__spec__, 'origin', None):
-    ROOT = Path(__spec__.origin).resolve().parents[2]
-else:
-    ROOT = Path.cwd().resolve()
-
-a = Analysis(
-    [str(ROOT / 'gui_preprocess_V3.3.py')],
+analysis = Analysis(
+    [str(ROOT / 'spike_detector_launcher.py')],
     pathex=[str(ROOT / 'src')],
     binaries=[],
-    datas=datas,
-    hiddenimports=hiddenimports,
+    datas=collect_data_files('matplotlib'),
+    hiddenimports=[
+        'PyQt6.QtCore',
+        'PyQt6.QtGui',
+        'PyQt6.QtWidgets',
+        'matplotlib.backends.backend_qtagg',
+        'openpyxl',
+        'pywt',
+        'sklearn.decomposition',
+        'sklearn.cluster',
+        'sklearn.metrics',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['PySide6'],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    excludes=['PySide6', 'PyQt5'],
     noarchive=False,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    analysis.scripts,
     [],
+    exclude_binaries=True,
     name='spike_detector',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
+)
+collection = COLLECT(
+    exe,
+    analysis.binaries,
+    analysis.datas,
+    strip=False,
+    upx=False,
+    name='spike_detector',
 )

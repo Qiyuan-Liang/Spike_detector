@@ -1,4 +1,5 @@
 import os
+import matplotlib as mpl
 
 
 def save_figure_with_dialog(get_save_filename, figure, default_name='figure.svg'):
@@ -17,5 +18,7 @@ def save_figure_with_dialog(get_save_filename, figure, default_name='figure.svg'
         filename = filename + '.svg'
         ext = 'svg'
     save_ext = 'jpg' if ext == 'jpeg' else ext
-    figure.savefig(filename, format=save_ext)
+    rc = {'svg.fonttype': 'none', 'pdf.fonttype': 42} if save_ext in ('svg', 'pdf') else {}
+    with mpl.rc_context(rc):
+        figure.savefig(filename, format=save_ext)
     return filename

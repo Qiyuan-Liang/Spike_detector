@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spike-detector-gui"
-version = "3.5.45"
+version = "3.6.31"
 description = "GUI spike detector for CS/SS activity in Purkinje neurons"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,10 +17,42 @@ dependencies = [
   "scikit-learn",
   "PyQt6",
   "openpyxl",
+  "PyYAML",
+]
+
+[project.optional-dependencies]
+notebooks = [
+  "ipykernel",
+  "ipython",
+  "ipywidgets",
+  "jupyterlab",
+  "nbconvert",
+  "notebook",
+  "seaborn",
+  "statsmodels",
+  "tqdm",
+]
+packaging = [
+  "pyinstaller",
+]
+all = [
+  "ipykernel",
+  "ipython",
+  "ipywidgets",
+  "jupyterlab",
+  "nbconvert",
+  "notebook",
+  "seaborn",
+  "statsmodels",
+  "tqdm",
+  "pyinstaller",
 ]
 
 [project.scripts]
 spike-detector = "spike_detector.gui:main"
+
+[tool.uv]
+package = true
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,0 +1,9 @@
+# UV/pip entry point for reproducing the full Spike Detector environment.
+#
+# With UV:
+#   uv venv --python 3.11
+#   uv pip install -r requirements.txt
+#
+# The editable install keeps local source changes active while installing the
+# GUI, notebook, and packaging dependencies declared in pyproject.toml.
+-e .[all]

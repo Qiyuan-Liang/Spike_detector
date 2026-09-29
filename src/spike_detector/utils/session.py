@@ -1,7 +1,9 @@
 import os
 import glob
+import re
 import numpy as np
 import pandas as pd
+from .validation import validate_time, validate_session
 
 
 def _list_table_files_in_dir(folder_path):
@@ -19,33 +21,42 @@ def _list_table_files_in_dir(folder_path):
     return sorted(files)
 
 
-def normalize_time_and_fs(time_vec_raw, default_fs=1000.0):
-    time_vec_raw = np.asarray(time_vec_raw, dtype=float)
-    mask_valid = ~np.isnan(time_vec_raw)
-    time_vec_raw = time_vec_raw[mask_valid]
-
-    frac_secs = np.mean(time_vec_raw < 1.0) if len(time_vec_raw) > 0 else 0.0
-    frac_ms = np.mean(time_vec_raw > 10.0) if len(time_vec_raw) > 0 else 0.0
-    if frac_secs > 0.5 and frac_ms < 0.5:
-        time_vec = time_vec_raw * 1000.0
-    elif frac_ms > 0.5:
-        time_vec = time_vec_raw
-    else:
-        med = float(np.median(np.abs(np.diff(time_vec_raw)))) if len(time_vec_raw) > 1 else 0.0
-        time_vec = time_vec_raw * 1000.0 if med < 0.01 else time_vec_raw
-
-    dt = float(np.median(np.diff(time_vec_raw))) if len(time_vec_raw) > 1 else 0.0
-    if dt > 0 and dt < 0.01:
-        time_vec_ms = time_vec_raw * 1000.0
-    else:
-        time_vec_ms = time_vec_raw
-
-    dt_ms = float(np.median(np.diff(time_vec_ms))) if len(time_vec_ms) > 1 else 1.0
-    fs = 1000.0 / dt_ms if dt_ms > 0 else float(default_fs)
-    return time_vec, time_vec_ms, fs, mask_valid
+def infer_time_unit(time_vec_raw, column_name=None, default_fs=1000.0):
+    """Infer table units from a labelled header, then plausible sampling rates."""
+    label = str(column_name or '').strip().lower()
+    if re.search(r'(?<![a-z])(ms|msec|millisecond|milliseconds)(?![a-z])', label):
+        return 'ms'
+    if re.search(r'(?<![a-z])(s|sec|second|seconds)(?![a-z])', label):
+        return 's'
+    t = np.asarray(time_vec_raw, dtype=float)
+    if t.ndim != 1 or t.size < 2 or not np.all(np.isfinite(t)):
+        raise ValueError('Time must contain at least two finite samples.')
+    step = float(np.median(np.diff(t)))
+    if step <= 0:
+        raise ValueError('Time must be strictly increasing.')
+    plausible = [u for u, rate in (('ms', 1000.0 / step), ('s', 1.0 / step))
+                 if 50.0 <= rate <= 30000.0]
+    if len(plausible) == 1:
+        return plausible[0]
+    raise ValueError('Ambiguous table time units: label the first column time_ms or time_s.')
 
 
-def load_table_session_file(file_path, default_fs=1000.0):
+def normalize_time_and_fs(time_vec_raw, default_fs=1000.0, time_unit='auto', column_name=None):
+    """Convert inferred or explicit units, retaining origin and every sample."""
+    if time_unit == 'auto':
+        time_unit = infer_time_unit(time_vec_raw, column_name, default_fs)
+    if time_unit not in ('ms', 's'):
+        raise ValueError('Table time units must be auto, ms or s.')
+    t = np.asarray(time_vec_raw, dtype=float)
+    time_ms = t * (1000.0 if time_unit == 's' else 1.0)
+    fs = validate_time(time_ms)
+    return time_ms, time_ms, fs, np.ones(t.size, dtype=bool)
+
+
+def load_table_session_file(file_path, default_fs=1000.0, time_unit='auto'):
+    stem = os.path.splitext(os.path.basename(file_path))[0].lower()
+    if stem.endswith(('_time_offsets', '_coordinates')):
+        raise ValueError('Auxiliary time-offset/coordinate table is not a spike trace recording.')
     if file_path.lower().endswith('.xlsx'):
         try:
             df = pd.read_excel(file_path, sheet_name='Sheet1', engine='openpyxl')
@@ -65,7 +76,8 @@ def load_table_session_file(file_path, default_fs=1000.0):
 
     time_vec_raw = pd.to_numeric(df.iloc[:, 0], errors='coerce').to_numpy(dtype=float)
     raw_matrix_full = df.iloc[:, 1:].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
-    _, time_vec_ms, fs, mask_valid = normalize_time_and_fs(time_vec_raw, default_fs=default_fs)
+    resolved_unit = infer_time_unit(time_vec_raw, df.columns[0], default_fs) if time_unit == 'auto' else time_unit
+    _, time_vec_ms, fs, mask_valid = normalize_time_and_fs(time_vec_raw, default_fs=default_fs, time_unit=resolved_unit)
 
     if raw_matrix_full.ndim != 2 or raw_matrix_full.shape[1] < 1:
         raise ValueError(
@@ -81,70 +93,38 @@ def load_table_session_file(file_path, default_fs=1000.0):
 
     raw_matrix_full = raw_matrix_full[mask_valid, :]
 
-    # Replace NaN/Inf in traces to keep downstream filtering stable.
     if not np.all(np.isfinite(raw_matrix_full)):
-        col_med = np.nanmedian(raw_matrix_full, axis=0)
-        col_med = np.where(np.isfinite(col_med), col_med, 0.0)
-        bad = ~np.isfinite(raw_matrix_full)
-        if np.any(bad):
-            raw_matrix_full[bad] = col_med[np.where(bad)[1]]
+        raise ValueError('Trace contains missing/nonfinite samples; repair or exclude them explicitly before detection.')
 
-    return {
+    data = {
+        'input_time_unit': resolved_unit,
         'time_ms': time_vec_ms,
         'raw_data': raw_matrix_full,
         'cell_names': df.columns[1:].tolist(),
         'fs': fs,
         'session_path': file_path,
     }
+    validate_session(data)
+    return data
 
 
-def load_session_path(session_path, default_fs=1000.0):
+def load_session_path(session_path, default_fs=1000.0, time_unit='auto'):
     if os.path.isfile(session_path):
         if session_path.lower().endswith('.npz'):
-            npz = np.load(session_path, allow_pickle=True)
-            return {
-                'time_ms': npz['time_ms'],
-                'raw_data': npz['raw_data'],
-                'cell_names': list(npz['cell_names']),
-                'fs': float(npz['fs']),
-                'session_path': session_path,
-            }
-        if session_path.lower().endswith('.xlsx') or session_path.lower().endswith('.csv'):
-            return load_table_session_file(session_path, default_fs=default_fs)
+            with np.load(session_path, allow_pickle=True) as npz:
+                data = {'time_ms': npz['time_ms'], 'raw_data': npz['raw_data'],
+                        'cell_names': list(npz['cell_names']), 'fs': float(npz['fs']),
+                        'session_path': session_path, 'input_time_unit': 'ms'}
+            validate_session(data)
+            return data
+        if session_path.lower().endswith(('.xlsx', '.csv')):
+            return load_table_session_file(session_path, default_fs, time_unit)
         raise ValueError(f'Unsupported file: {session_path}')
-
-    npz_files = glob.glob(os.path.join(session_path, '*_analyzed.npz'))
-    # Also check the centralised spike_detection/ folder in the parent directory
+    npz_files = sorted(glob.glob(os.path.join(session_path, '*_analyzed.npz')))
     if not npz_files:
-        parent = os.path.dirname(session_path)
-        sd_dir = os.path.join(parent, 'spike_detection')
-        folder_name = os.path.basename(session_path)
-        candidate = os.path.join(sd_dir, folder_name + '_analyzed.npz')
-        if os.path.isfile(candidate):
-            npz_files = [candidate]
-        else:
-            # try any matching prefix in spike_detection/
-            npz_files = sorted(glob.glob(os.path.join(sd_dir, folder_name + '*_analyzed.npz')))
-    if len(npz_files) > 0:
-        npz = np.load(npz_files[0], allow_pickle=True)
-        return {
-            'time_ms': npz['time_ms'],
-            'raw_data': npz['raw_data'],
-            'cell_names': list(npz['cell_names']),
-            'fs': float(npz['fs']),
-            'session_path': npz_files[0],
-        }
-
-    table_files = _list_table_files_in_dir(session_path)
-    if not table_files:
+        sd_dir = os.path.join(os.path.dirname(session_path), 'spike_detection')
+        npz_files = sorted(glob.glob(os.path.join(sd_dir, os.path.basename(session_path) + '*_analyzed.npz')))
+    files = npz_files or _list_table_files_in_dir(session_path)
+    if not files:
         raise FileNotFoundError(f'No .npz, .xlsx, or .csv found in {session_path}')
-
-    data = load_table_session_file(table_files[0], default_fs=default_fs)
-    time_vec = np.asarray(data['time_ms'], dtype=float)
-    raw_data = np.asarray(data['raw_data'], dtype=float)
-    if not np.all(np.diff(time_vec) >= 0):
-        order = np.argsort(time_vec)
-        data['time_ms'] = time_vec[order]
-        data['raw_data'] = raw_data[order, :]
-    data['session_path'] = session_path
-    return data
+    return load_session_path(files[0], default_fs, time_unit)

@@ -58,37 +58,15 @@ def detrend_trace(trace, fs, window_sec=0.05, percentile=20):
 
 
 def butter_bandpass(lowcut, highcut, fs, order=3):
-    nyq = 0.5 * fs
-    if lowcut is None and highcut is None:
+    from .validation import validate_band
+    low, high = validate_band(lowcut, highcut, fs, order)
+    if not low and not high:
         return None
-
-    def _norm(val):
-        if val is None:
-            return None
-        try:
-            v = float(val)
-        except Exception:
-            return None
-        if not np.isfinite(v) or v <= 0.0:
-            return None
-        return v / float(nyq)
-
-    low_n = _norm(lowcut)
-    high_n = _norm(highcut)
-    if low_n is None and high_n is None:
-        return None
-    if high_n is not None and high_n >= 1.0:
-        high_n = 1.0 - 1e-3
-    if low_n is not None and high_n is not None and low_n >= high_n:
-        return None
-    try:
-        if low_n is None:
-            return butter(order, high_n, btype='low', output='sos')
-        if high_n is None:
-            return butter(order, low_n, btype='high', output='sos')
-        return butter(order, [low_n, high_n], btype='band', output='sos')
-    except ValueError:
-        return None
+    if not low:
+        return butter(order, high, btype='low', fs=fs, output='sos')
+    if not high:
+        return butter(order, low, btype='high', fs=fs, output='sos')
+    return butter(order, [low, high], btype='band', fs=fs, output='sos')
 
 
 def apply_filter(trace, fs, low=None, high=None, order=3):
@@ -177,8 +155,8 @@ def _resample_trace_to_fs(trace, src_fs, target_fs):
         return x.copy()
     if abs(src - dst) < 1e-9:
         return x.copy()
-    n_out = int(round(x.size * dst / src))
-    return _resample_to_length(x, max(2, n_out))
+    n_out = int(np.floor((x.size - 1) * dst / src + 1e-9)) + 1
+    return np.interp(np.arange(n_out)/dst, np.arange(x.size)/src, x)
 
 
 def _orient_template_peak_positive(template):
@@ -276,7 +254,7 @@ def _llr_probability_vector(trace, mu_signal, sigma_signal, mu_noise, sigma_nois
     return np.asarray(term_signal - term_noise, dtype=float)
 
 
-def _compute_llr_from_template_bank(trace, template_bank, fs_bank, fs, force_peak_positive=False):
+def _compute_llr_from_template_bank(trace, template_bank, fs_bank, fs, force_peak_positive=False, noise_mask=None):
     x = np.asarray(trace, dtype=float).ravel()
     if x.size == 0:
         return x
@@ -284,8 +262,11 @@ def _compute_llr_from_template_bank(trace, template_bank, fs_bank, fs, force_pea
     if mu_signal is None or stack is None:
         return np.zeros_like(x)
 
-    mu_noise = float(np.nanmedian(x))
-    sigma_noise = float(estimate_noise_mad(x))
+    noise = x if noise_mask is None else x[~noise_mask]
+    if noise.size < 3:
+        return np.zeros_like(x)
+    mu_noise = float(np.nanmedian(noise))
+    sigma_noise = float(estimate_noise_mad(noise))
     sigma_noise = max(abs(sigma_noise), 1e-9)
 
     n_templates = int(stack.shape[0])
@@ -296,6 +277,73 @@ def _compute_llr_from_template_bank(trace, template_bank, fs_bank, fs, force_pea
     sigma_signal = np.maximum(np.asarray(sigma_signal, dtype=float), max(1e-9, sigma_noise * 1e-3))
 
     return _llr_probability_vector(x, mu_signal, sigma_signal, mu_noise, sigma_noise)
+
+
+def _similarity_score(trace, template_bank, fs_bank, fs, short_core=False):
+    """Pearson similarity and fitted positive response for an event-centred template.
+
+    A short SS core permits truncated recovery tails in rapid bursts. The fitted
+    response is kept separately so a high correlation with tiny noise cannot
+    become a spike by itself.
+    """
+    mu, _ = _build_template_distribution(template_bank, fs_bank, fs, force_peak_positive=True)
+    x = np.asarray(trace, dtype=float).ravel()
+    if mu is None:
+        return np.zeros_like(x), np.zeros_like(x), 0
+    if short_core:
+        length = min(mu.size, max(5, int(round(0.003 * fs)) | 1))
+        center = mu.size // 2
+        lo = min(max(0, center - length // 2), mu.size - length)
+        mu = mu[lo:lo + length]
+    m = mu.size
+    kernel = mu - np.mean(mu)
+    norm = float(np.linalg.norm(kernel))
+    if norm < 1e-9:
+        return np.zeros_like(x), np.zeros_like(x), m // 2
+    kernel /= norm
+    response = fftconvolve(x, kernel[::-1], mode='same')
+    sums = fftconvolve(x, np.ones(m), mode='same')
+    sums2 = fftconvolve(x*x, np.ones(m), mode='same')
+    energy = np.sqrt(np.maximum(1e-12, sums2 - sums*sums/m))
+    similarity = np.clip(response / energy, -1.0, 1.0)
+    return similarity, response, m // 2
+
+
+def _amplitude_fitted_llr_score(trace, template_bank, fs_bank, fs, noise_mask, short_core=False):
+    """Positive-amplitude Gaussian GLRT gain for a bank's mean waveform.
+
+    Fitting the amplitude prevents pooled bright-cell templates from rejecting
+    same-shaped events in dim cells. A short SS core tolerates burst overlap.
+    """
+    similarity, response, support = _similarity_score(trace, template_bank, fs_bank, fs, short_core)
+    sigma = max(float(_masked_sigma(trace, noise_mask)), 1e-9)
+    z = np.maximum(response, 0.0) / sigma
+    return 0.5 * z * z, response, similarity, support
+
+
+def _positive_core_ss_score(trace, template_bank, fs_bank, fs, noise_mask):
+    """Fit a positive SS core without imposing a neighboring-event prior.
+
+    The baseline-corrected trace has zero as its null mean. Clipping negative
+    template weights prevents nearby downward oscillations from increasing the
+    matched response to a small positive deflection.
+    """
+    mu, _ = _build_template_distribution(template_bank, fs_bank, fs, force_peak_positive=True)
+    x = np.asarray(trace, dtype=float).ravel()
+    if mu is None:
+        return np.zeros_like(x), np.zeros_like(x), 0
+    length = min(mu.size, max(5, int(round(0.003 * fs)) | 1))
+    center = mu.size // 2
+    start = min(max(0, center - length // 2), mu.size - length)
+    core = np.maximum(mu[start:start + length], 0.0)
+    norm = float(np.linalg.norm(core))
+    if norm < 1e-9:
+        return np.zeros_like(x), np.zeros_like(x), length // 2
+    kernel = core / norm
+    response = fftconvolve(x, kernel[::-1], mode='same')
+    sigma = max(float(_masked_sigma(x, noise_mask)), 1e-9)
+    score = 0.5 * (np.maximum(response, 0.0) / sigma) ** 2
+    return score, response, length // 2
 
 
 def _kmeans_points(points, k, max_iter=40):
@@ -320,7 +368,8 @@ def _kmeans_points(points, k, max_iter=40):
     return labels
 
 
-def _build_parallel_template_banks(template_bank, fs_bank, target_fs, force_peak_positive=False, max_use_types=3):
+def _build_parallel_template_banks(template_bank, fs_bank, target_fs, force_peak_positive=False,
+                                   max_use_types=3, n_components=2, selected_groups=None):
     if template_bank is None or len(template_bank) == 0:
         return []
     rows = []
@@ -335,7 +384,8 @@ def _build_parallel_template_banks(template_bank, fs_bank, target_fs, force_peak
                 continue
             if force_peak_positive:
                 arr = _orient_template_peak_positive(arr)
-            arr_rs = _resample_template_to_fs(arr, tpl_fs, target_fs)
+            # Keep group identities stable across recording sampling rates.
+            arr_rs = _resample_template_to_fs(arr, tpl_fs, TEMPLATE_TARGET_FS)
             if arr_rs.size > 3 and np.all(np.isfinite(arr_rs)):
                 rows.append(np.asarray(arr_rs, dtype=float).ravel())
         except Exception:
@@ -347,11 +397,14 @@ def _build_parallel_template_banks(template_bank, fs_bank, target_fs, force_peak
     m = max(4, int(np.median(lengths)))
     stack = np.vstack([_resample_to_length(r, m) for r in rows])
 
-    centered = stack - np.mean(stack, axis=0, keepdims=True)
+    # Cluster waveform shape, not brightness; the detector fits amplitude later.
+    normalized = stack - np.mean(stack, axis=1, keepdims=True)
+    normalized /= np.maximum(np.linalg.norm(normalized, axis=1, keepdims=True), 1e-9)
+    centered = normalized - np.mean(normalized, axis=0, keepdims=True)
     if centered.shape[0] > 1 and centered.shape[1] > 1:
         try:
             _, _, vt = np.linalg.svd(centered, full_matrices=False)
-            n_pc = max(1, min(2, vt.shape[0]))
+            n_pc = max(1, min(int(n_components), vt.shape[0]))
             feats = centered @ vt[:n_pc].T
         except Exception:
             feats = centered[:, :1]
@@ -359,19 +412,23 @@ def _build_parallel_template_banks(template_bank, fs_bank, target_fs, force_peak
         feats = centered[:, :1]
 
     n_templates = stack.shape[0]
-    k_clusters = max(1, min(max(4, max_use_types), n_templates))
+    k_clusters = max(1, min(int(max_use_types), n_templates))
     labels = _kmeans_points(feats, k_clusters)
 
     unique, counts = np.unique(labels, return_counts=True)
     order = np.argsort(-counts)
-    chosen = [int(unique[idx]) for idx in order[:max(1, min(int(max_use_types), unique.size))]]
+    chosen = [int(unique[idx]) for idx in order]
 
     out = []
-    for cid in chosen:
+    active = None if selected_groups is None else set(int(group) for group in selected_groups)
+    for group_number, cid in enumerate(chosen, start=1):
+        if active is not None and group_number not in active:
+            continue
         mask = labels == cid
         if not np.any(mask):
             continue
-        bank = [stack[i].copy() for i in np.where(mask)[0]]
+        bank = [_resample_template_to_fs(stack[i], TEMPLATE_TARGET_FS, target_fs)
+                for i in np.where(mask)[0]]
         fs_list = [float(target_fs)] * len(bank)
         out.append((bank, fs_list))
     return out
@@ -424,311 +481,283 @@ def _filter_peaks_min_fwhm(signal, peaks, fs_hz, min_fwhm_ms):
         return np.sort(np.unique(p))
 
 
+def exclusion_mask(n, fs, cs_peaks=(), pre_ms=0, post_ms=0, initial_ms=0):
+    """True marks excluded samples; intervals include the CS sample when enabled."""
+    mask = np.zeros(n, dtype=bool)
+    mask[:min(n, int(np.ceil(initial_ms*fs/1000)))] = True
+    before, after = int(np.ceil(pre_ms*fs/1000)), int(np.ceil(post_ms*fs/1000))
+    if before or after:
+        for p in cs_peaks:
+            mask[max(0, int(p)-before):min(n, int(p)+after+1)] = True
+    return mask
+
+
+def _masked_sigma(trace, mask):
+    clean = np.asarray(trace)[~mask]
+    return estimate_noise_mad(clean) if clean.size >= 3 else np.inf
+
+
+def _masked_local_sigma(trace, mask, window):
+    # Compute robust residual noise without allowing excluded samples into windows.
+    import pandas as pd
+    x = pd.Series(np.where(mask, np.nan, trace))
+    size = max(5, min(len(x), int(window)))
+    median = x.rolling(size, center=True, min_periods=3).median()
+    mad = (x-median).abs().rolling(size, center=True, min_periods=3).median()*1.4826
+    floor = _masked_sigma(trace, mask)
+    return np.maximum(mad.fillna(floor).to_numpy(), max(1e-9, floor*.1))
+
+
+def _select_peaks(trace, threshold, distance, mask):
+    # Remove invalid/excluded candidates before refractory competition.
+    peaks, _ = find_peaks(trace, height=threshold)
+    peaks = peaks[~mask[peaks]]
+    return _suppress_candidates(trace, peaks, distance)
+
+
+def _suppress_candidates(trace, peaks, distance):
+    peaks = np.asarray(peaks, dtype=int)
+    kept = []
+    blocked = np.zeros(len(trace), dtype=bool)
+    for p in peaks[np.argsort(-np.asarray(trace)[peaks], kind='stable')]:
+        if not blocked[p]:
+            kept.append(int(p))
+            blocked[max(0, p-distance+1):min(len(trace), p+distance)] = True
+    return np.asarray(sorted(kept), dtype=int)
+
+
+def _cs_width_filter(trace, peaks, fs, limit, align_ms=0):
+    from .widths import measure_widths
+    rows = measure_widths(trace, peaks, fs, 100, align_ms=align_ms)
+    keep = []
+    for row in rows:
+        measured = np.isfinite(row['fwhm_ms'])
+        row['decision'] = ('pass' if row['fwhm_ms'] > limit or limit <= 0 else 'fail') if measured else 'uncertain'
+        if row['decision'] != 'fail':
+            keep.append(row['candidate_index'])
+    return np.asarray(keep, dtype=int), rows
+
+
+def _prepare_detection(raw, fs, negative_going, use_preprocessed, pre_detrended, pre_baseline,
+                       pre_detrended_cs, pre_detrended_ss):
+    raw = np.asarray(raw, dtype=float)
+    if raw.ndim != 1 or raw.size < 3 or not np.all(np.isfinite(raw)):
+        raise ValueError('Detection requires a finite one-dimensional trace with at least three samples.')
+    if not np.isfinite(fs) or fs <= 0:
+        raise ValueError('Sampling rate must be finite and positive.')
+    if use_preprocessed and pre_detrended is not None and pre_baseline is not None:
+        detrended, baseline = np.asarray(pre_detrended), np.asarray(pre_baseline)
+    else:
+        detrended, baseline = detrend_trace(-raw if negative_going else raw, fs)
+    cs = np.asarray(pre_detrended_cs) if pre_detrended_cs is not None else detrended
+    ss = np.asarray(pre_detrended_ss) if pre_detrended_ss is not None else detrended
+    for array in (detrended, baseline, cs, ss):
+        if array.shape != raw.shape or not np.all(np.isfinite(array)):
+            raise ValueError('Preprocessed trace/baseline must be finite and match the raw trace.')
+    return detrended, baseline, cs, ss
+
+
+def process_cell_simple(raw_trace, fs, negative_going=True,
+                        cs_low_cut=0.0, cs_high_cut=150.0, cs_thresh_sigma=6.0, cs_min_dist_ms=25,
+                        cs_min_fwhm_ms=4.0, ss_low_cut=0.0, ss_high_cut=0.0, ss_thresh_sigma=2.5,
+                        ss_min_dist_ms=2, ss_blank_ms=15, ss_min_width_ms=1, ss_max_width_ms=6,
+                        use_preprocessed=False, pre_detrended=None, pre_baseline=None,
+                        pre_detrended_cs=None, pre_detrended_ss=None,
+                        initial_blank_ms=0.0, cs_order=3, ss_order=3,
+                        local_baseline=False, local_baseline_cs_ms=200.0, local_baseline_ss_ms=50.0,
+                        ss_mask_pre_ms=None, ss_mask_post_ms=None):
+    detrended, baseline, cs, ss = _prepare_detection(raw_trace, fs, negative_going, use_preprocessed,
+        pre_detrended, pre_baseline, pre_detrended_cs, pre_detrended_ss)
+    cs = apply_filter(cs, fs, cs_low_cut, cs_high_cut, cs_order)
+    ss = apply_filter(ss, fs, ss_low_cut, ss_high_cut, ss_order)
+    cs_mask = exclusion_mask(len(cs), fs, initial_ms=initial_blank_ms)
+    sigma_cs = _masked_sigma(cs, cs_mask)
+    cs_threshold = cs_thresh_sigma * (_masked_local_sigma(cs, cs_mask, local_baseline_cs_ms*fs/1000)
+                                     if local_baseline else sigma_cs)
+    cs_peaks = _select_peaks(cs, cs_threshold, max(1, int(np.ceil(cs_min_dist_ms*fs/1000))), cs_mask)
+    cs_peaks, cs_widths = _cs_width_filter(cs, cs_peaks, fs, cs_min_fwhm_ms)
+    pre = ss_blank_ms/2 if ss_mask_pre_ms is None else ss_mask_pre_ms
+    post = ss_blank_ms/2 if ss_mask_post_ms is None else ss_mask_post_ms
+    ss_mask = exclusion_mask(len(ss), fs, cs_peaks, pre, post, initial_blank_ms)
+    sigma_ss = _masked_sigma(ss, ss_mask)
+    ss_threshold = ss_thresh_sigma * (_masked_local_sigma(ss, ss_mask, local_baseline_ss_ms*fs/1000)
+                                     if local_baseline else sigma_ss)
+    ss_peaks = _select_peaks(ss, ss_threshold, max(1, int(np.ceil(ss_min_dist_ms*fs/1000))), ss_mask)
+    result = dict(detrended=detrended, baseline=baseline, cs_trace=cs, ss_trace=ss,
+                  cs_peaks=cs_peaks, ss_peaks=ss_peaks, sigma_cs=sigma_cs, sigma_ss=sigma_ss,
+                  raw_sigma=estimate_noise_mad(detrended), det_method='Threshold',
+                  threshold_mode='Sigma x MAD (local)' if local_baseline else 'Sigma x MAD',
+                  local_baseline=bool(local_baseline), cs_threshold_used=cs_thresh_sigma*sigma_cs,
+                  ss_threshold_used=ss_thresh_sigma*sigma_ss, cs_width_candidates=cs_widths,
+                  cs_exclusion_mask=cs_mask, ss_exclusion_mask=ss_mask,
+                  ss_mask_pre_ms_used=pre, ss_mask_post_ms_used=post)
+    if local_baseline:
+        result.update(cs_threshold_trace=cs_threshold, ss_threshold_trace=ss_threshold)
+    return result
+
+
 def process_cell_template_matching(raw_trace, fs,
                                    template_cs_bank=None, template_ss_bank=None,
                                    template_cs_fs_bank=None, template_ss_fs_bank=None,
                                    negative_going=True,
                                    cs_low_cut=0.0, cs_high_cut=150.0, cs_thresh_sigma=6.0, cs_min_dist_ms=25,
-                                   cs_min_fwhm_ms=4.0,
-                                   ss_low_cut=0.0, ss_high_cut=0.0, ss_thresh_sigma=2.5,
+                                   cs_min_fwhm_ms=4.0, ss_low_cut=0.0, ss_high_cut=0.0, ss_thresh_sigma=3.0,
                                    ss_min_dist_ms=2, ss_blank_ms=15,
-                                   template_match_method='LLR Probability Vector',
-                                   parallel_match=False,
+                                   template_match_method='LLR Probability Vector', parallel_match=False,
                                    use_preprocessed=False, pre_detrended=None, pre_baseline=None,
                                    pre_detrended_cs=None, pre_detrended_ss=None,
-                                   initial_blank_ms=0.0, cs_order=3, ss_order=3):
-    working = raw_trace * -1 if negative_going else raw_trace
-    if use_preprocessed and pre_detrended is not None and pre_baseline is not None:
-        detrended = pre_detrended
-        baseline = pre_baseline
-    else:
-        detrended, baseline = detrend_trace(working, fs, window_sec=0.05, percentile=20)
+                                   initial_blank_ms=0.0, cs_order=3, ss_order=3,
+                                   ss_mask_pre_ms=None, ss_mask_post_ms=None,
+                                   cs_similarity_threshold=0.90, ss_similarity_threshold=0.80,
+                                   similarity_min_response_sigma=2.2,
+                                   template_ss_lowpass_hz=0.0,
+                                   fixed_exclusion_masks=None,
+                                   parallel_groups=3, parallel_components=2,
+                                   cs_selected_groups=None, ss_selected_groups=None,
+                                   cs_min_filtered_peak_sigma=3.0):
+    if template_match_method not in ('LLR Probability Vector', 'Normalized Similarity', 'Burst-aware LLR'):
+        raise ValueError('Unsupported template match method.')
+    for val in (cs_similarity_threshold, ss_similarity_threshold):
+        if not np.isfinite(val) or not 0 < val <= 1:
+            raise ValueError('Similarity thresholds must be between 0 and 1.')
+    if not np.isfinite(similarity_min_response_sigma) or similarity_min_response_sigma <= 0:
+        raise ValueError('Minimum similarity response must be positive.')
+    if not np.isfinite(cs_min_filtered_peak_sigma) or cs_min_filtered_peak_sigma < 0:
+        raise ValueError('Minimum CS filtered-trace peak must be finite and nonnegative.')
+    if not np.isfinite(template_ss_lowpass_hz) or template_ss_lowpass_hz < 0:
+        raise ValueError('Template SS low-pass must be nonnegative.')
+    detrended, baseline, cs, ss = _prepare_detection(raw_trace, fs, negative_going, use_preprocessed,
+        pre_detrended, pre_baseline, pre_detrended_cs, pre_detrended_ss)
+    cs = apply_filter(cs, fs, cs_low_cut, cs_high_cut, cs_order)
+    ss = apply_filter(ss, fs, ss_low_cut, ss_high_cut, ss_order)
+    lowpass_used = 0.0
+    if template_ss_lowpass_hz > 0:
+        lowpass_used = min(float(template_ss_lowpass_hz), 0.45 * fs)
+        ss = apply_filter(ss, fs, high=lowpass_used, order=ss_order)
+    sim_fs = max(fs, TEMPLATE_TARGET_FS)
+    cs_sim, ss_sim = _resample_trace_to_fs(cs, fs, sim_fs), _resample_trace_to_fs(ss, fs, sim_fs)
+    fixed_masks = None
+    if fixed_exclusion_masks is not None:
+        fixed_masks = {}
+        for kind in ('cs', 'ss'):
+            native = np.asarray(fixed_exclusion_masks[kind], dtype=bool)
+            if native.ndim != 1 or native.size != len(cs):
+                raise ValueError(f'Fixed {kind.upper()} mask must match the native trace length.')
+            sample_map_sim = np.minimum(np.rint(np.arange(len(cs_sim))*fs/sim_fs).astype(int), len(cs)-1)
+            fixed_masks[kind] = native[sample_map_sim]
+    cs_mask = (fixed_masks['cs'] if fixed_masks is not None else
+               exclusion_mask(len(cs_sim), sim_fs, initial_ms=initial_blank_ms))
 
-    detr_for_detection = detrended
-    detr_for_detection_cs = np.asarray(pre_detrended_cs, dtype=float) if pre_detrended_cs is not None else detr_for_detection
-    detr_for_detection_ss = np.asarray(pre_detrended_ss, dtype=float) if pre_detrended_ss is not None else detr_for_detection
-
-    global_sigma = estimate_noise_mad(detrended)
-
-    sim_fs = float(max(float(fs), TEMPLATE_TARGET_FS))
-    cs_base = apply_filter(detr_for_detection_cs, fs, low=cs_low_cut, high=cs_high_cut, order=cs_order)
-    cs_base_sim = _resample_trace_to_fs(cs_base, fs, sim_fs)
-    if bool(parallel_match):
-        cs_banks = _build_parallel_template_banks(template_cs_bank, template_cs_fs_bank, sim_fs,
-                                                  force_peak_positive=bool(negative_going),
-                                                  max_use_types=3)
-        cs_scores = []
-        cs_union_candidates = []
-        cs_thr_each = []
-        for bk, bk_fs in cs_banks:
-            s = _compute_llr_from_template_bank(cs_base_sim, bk, bk_fs, sim_fs, force_peak_positive=False)
-            cs_scores.append(s)
-            try:
-                sig_i = estimate_noise_mad(s)
-                thr_i = float(cs_thresh_sigma * sig_i)
-                cs_thr_each.append(thr_i)
-                p_i, _ = find_peaks(s, height=thr_i, distance=max(1, int((cs_min_dist_ms / 1000.0) * sim_fs)))
-                if p_i.size > 0:
-                    cs_union_candidates.append(np.asarray(p_i, dtype=int))
-            except Exception:
-                pass
-        if len(cs_scores) > 0:
-            cs_trace_sim = np.maximum.reduce(cs_scores)
+    def score_and_detect(trace, bank, rates, sigma, similarity_threshold, spacing, mask, short_core,
+                         selected_groups, mask_is_safe=False):
+        if bank is None or len(bank) == 0:
+            return np.zeros_like(trace), np.array([], dtype=int), np.nan, mask, dict(
+                score_peaks=0, masked=0, response_rejected=0, peak_rejected=0,
+                refractory_rejected=0, accepted=0, no_templates=True)
+        for i, tpl in enumerate(bank):
+            arr = np.asarray(tpl, dtype=float)
+            rate = rates[i] if rates is not None and i < len(rates) else sim_fs
+            if arr.ndim != 1 or arr.size < 4 or not np.all(np.isfinite(arr)) or not np.isfinite(rate) or rate <= 0:
+                raise ValueError('Templates need finite waveforms and positive sampling rates.')
+        banks = (_build_parallel_template_banks(bank, rates, sim_fs, force_peak_positive=True,
+                 max_use_types=parallel_groups, n_components=parallel_components,
+                 selected_groups=selected_groups)
+                 if parallel_match else [(bank, rates)])
+        if not banks:
+            return np.zeros_like(trace), np.array([], dtype=int), np.nan, mask, dict(
+                score_peaks=0, masked=0, response_rejected=0, peak_rejected=0,
+                refractory_rejected=0, accepted=0, no_active_groups=True)
+        scores, candidates, thresholds = [], [], []
+        diagnostics = dict(score_peaks=0, masked=0, response_rejected=0, peak_rejected=0,
+                           refractory_rejected=0, accepted=0)
+        # Score windows touching excluded data are excluded too; never zero the trace.
+        support = max(len(_resample_template_to_fs(tpl, rates[i] if rates is not None and i < len(rates) else sim_fs, sim_fs))
+                      for i, tpl in enumerate(bank))//2
+        if short_core:
+            support = min(support, max(5, int(round(0.003 * sim_fs)) | 1)//2)
+        from scipy.ndimage import maximum_filter1d
+        if mask_is_safe:
+            safe_mask = mask.copy()
         else:
-            cs_trace_sim = _compute_llr_from_template_bank(cs_base_sim, template_cs_bank, template_cs_fs_bank, sim_fs, force_peak_positive=bool(negative_going))
-    else:
-        cs_trace_sim = _compute_llr_from_template_bank(cs_base_sim, template_cs_bank, template_cs_fs_bank, sim_fs, force_peak_positive=bool(negative_going))
-    sigma_cs = estimate_noise_mad(cs_trace_sim)
-    cs_dist = max(1, int((cs_min_dist_ms / 1000.0) * sim_fs))
-    cs_has_templates = template_cs_bank is not None and len(template_cs_bank) > 0
-    if cs_has_templates:
-        cs_threshold_used = float(cs_thresh_sigma * sigma_cs)
-        cs_candidates_sim, _ = find_peaks(cs_trace_sim, height=cs_threshold_used, distance=cs_dist)
-        if bool(parallel_match):
-            extra = []
-            try:
-                if len(cs_union_candidates) > 0:
-                    extra.append(np.concatenate(cs_union_candidates))
-            except Exception:
-                pass
-            if len(extra) > 0:
-                cs_candidates_sim = np.unique(np.concatenate([cs_candidates_sim] + extra).astype(int))
-            try:
-                if len(cs_thr_each) > 0:
-                    cs_threshold_used = float(min([cs_threshold_used] + cs_thr_each))
-            except Exception:
-                pass
-    else:
-        cs_threshold_used = np.nan
-        cs_candidates_sim = np.array([], dtype=int)
-    cs_candidates_sim = _filter_peaks_min_fwhm(cs_trace_sim, cs_candidates_sim, sim_fs, cs_min_fwhm_ms)
-    if initial_blank_ms is not None and initial_blank_ms > 0:
-        init_blank_samples = int((initial_blank_ms / 1000.0) * sim_fs)
-        cs_candidates_sim = cs_candidates_sim[cs_candidates_sim >= init_blank_samples]
-    if cs_candidates_sim.size > 0:
-        cs_peaks = np.unique(np.clip(np.round(cs_candidates_sim * (fs / sim_fs)).astype(int), 0, len(raw_trace) - 1))
-    else:
-        cs_peaks = np.array([], dtype=int)
+            safe_mask = maximum_filter1d(mask.astype(np.uint8), size=2*support+1, mode='constant') > 0
+            safe_mask[:support] = True
+            if support:
+                safe_mask[-support:] = True
+        response_floor = max(similarity_min_response_sigma, 3.0 if not short_core else 0.0) * _masked_sigma(trace, safe_mask)
+        for bk, br in banks:
+            if template_match_method == 'Normalized Similarity':
+                score, response, _ = _similarity_score(trace, bk, br, sim_fs, short_core)
+                threshold = similarity_threshold
+            elif template_match_method == 'Burst-aware LLR' and short_core:
+                score, response, _ = _positive_core_ss_score(
+                    trace, bk, br, sim_fs, safe_mask)
+                threshold = 0.5 * float(sigma)**2
+            else:
+                score, response, _, _ = _amplitude_fitted_llr_score(
+                    trace, bk, br, sim_fs, safe_mask, short_core)
+                # Map the user-selected matched-response ratio to its GLRT gain.
+                # This is not a calibrated false-positive probability.
+                threshold = 0.5 * float(sigma)**2
+            scores.append(score)
+            thresholds.append(threshold)
+            found, _ = find_peaks(score, height=threshold)
+            diagnostics['score_peaks'] += len(found)
+            diagnostics['masked'] += int(np.count_nonzero(safe_mask[found]))
+            found = found[~safe_mask[found]]
+            diagnostics['response_rejected'] += int(np.count_nonzero(response[found] < response_floor))
+            found = found[response[found] >= response_floor]
+            if not short_core and cs_min_filtered_peak_sigma > 0:
+                # A long CS template can match slow baseline structure. Require
+                # an actual local deflection as well as integrated evidence.
+                cs_height_floor = cs_min_filtered_peak_sigma * _masked_sigma(trace, safe_mask)
+                diagnostics['peak_rejected'] += int(np.count_nonzero(trace[found] < cs_height_floor))
+                found = found[trace[found] >= cs_height_floor]
+            candidates.extend(found)
+        score = np.maximum.reduce([s - t for s, t in zip(scores, thresholds)]) if len(scores) > 1 else scores[0]
+        display_threshold = 0.0 if len(scores) > 1 else thresholds[0]
+        # Apply the Advanced Settings spacing once, across all template groups.
+        candidates = np.unique(candidates).astype(int)
+        candidates = candidates[~safe_mask[candidates]]
+        peaks = _suppress_candidates(score, candidates, max(1, int(np.ceil(spacing*sim_fs/1000))))
+        diagnostics['refractory_rejected'] += len(candidates) - len(peaks)
+        diagnostics['accepted'] = len(peaks)
+        return score, peaks, display_threshold, safe_mask, diagnostics
 
-    ss_base = apply_filter(detr_for_detection_ss, fs, low=ss_low_cut, high=ss_high_cut, order=ss_order)
-    ss_base_sim = _resample_trace_to_fs(ss_base, fs, sim_fs)
-    ss_base_clean_sim = ss_base_sim.copy()
-    blank_samples = max(0, int((ss_blank_ms / 1000.0) * sim_fs))
-    for cs_idx in cs_candidates_sim:
-        start = max(0, cs_idx - blank_samples // 2)
-        end = min(len(ss_base_clean_sim), start + blank_samples)
-        ss_base_clean_sim[start:end] = 0
-
-    if bool(parallel_match):
-        ss_banks = _build_parallel_template_banks(template_ss_bank, template_ss_fs_bank, sim_fs,
-                                                  force_peak_positive=bool(negative_going),
-                                                  max_use_types=3)
-        ss_scores = []
-        ss_union_candidates = []
-        ss_thr_each = []
-        for bk, bk_fs in ss_banks:
-            s = _compute_llr_from_template_bank(ss_base_clean_sim, bk, bk_fs, sim_fs, force_peak_positive=False)
-            ss_scores.append(s)
-            try:
-                sig_i = estimate_noise_mad(s)
-                thr_i = float(ss_thresh_sigma * sig_i)
-                ss_thr_each.append(thr_i)
-                p_i, _ = find_peaks(s, height=thr_i, distance=max(1, int((ss_min_dist_ms / 1000.0) * sim_fs)))
-                if p_i.size > 0:
-                    ss_union_candidates.append(np.asarray(p_i, dtype=int))
-            except Exception:
-                pass
-        if len(ss_scores) > 0:
-            ss_trace_sim = np.maximum.reduce(ss_scores)
-        else:
-            ss_trace_sim = _compute_llr_from_template_bank(ss_base_clean_sim, template_ss_bank, template_ss_fs_bank, sim_fs, force_peak_positive=bool(negative_going))
-    else:
-        ss_trace_sim = _compute_llr_from_template_bank(ss_base_clean_sim, template_ss_bank, template_ss_fs_bank, sim_fs, force_peak_positive=bool(negative_going))
-
-    sigma_ss = estimate_noise_mad(ss_trace_sim)
-    ss_dist = max(1, int((ss_min_dist_ms / 1000.0) * sim_fs))
-    ss_has_templates = template_ss_bank is not None and len(template_ss_bank) > 0
-    if ss_has_templates:
-        ss_threshold_used = float(ss_thresh_sigma * sigma_ss)
-        ss_candidates_sim, _ = find_peaks(ss_trace_sim, height=ss_threshold_used, distance=ss_dist)
-        if bool(parallel_match):
-            extra = []
-            try:
-                if len(ss_union_candidates) > 0:
-                    extra.append(np.concatenate(ss_union_candidates))
-            except Exception:
-                pass
-            if len(extra) > 0:
-                ss_candidates_sim = np.unique(np.concatenate([ss_candidates_sim] + extra).astype(int))
-            try:
-                if len(ss_thr_each) > 0:
-                    ss_threshold_used = float(min([ss_threshold_used] + ss_thr_each))
-            except Exception:
-                pass
-    else:
-        ss_threshold_used = np.nan
-        ss_candidates_sim = np.array([], dtype=int)
-    if initial_blank_ms is not None and initial_blank_ms > 0:
-        init_blank_samples = int((initial_blank_ms / 1000.0) * sim_fs)
-        ss_candidates_sim = ss_candidates_sim[ss_candidates_sim >= init_blank_samples]
-    if ss_candidates_sim.size > 0:
-        ss_peaks = np.unique(np.clip(np.round(ss_candidates_sim * (fs / sim_fs)).astype(int), 0, len(raw_trace) - 1))
-    else:
-        ss_peaks = np.array([], dtype=int)
-
-    cs_similarity_trace = _resample_to_length(cs_trace_sim, len(raw_trace))
-    ss_similarity_trace = _resample_to_length(ss_trace_sim, len(raw_trace))
-    ss_base_clean = _resample_to_length(ss_base_clean_sim, len(raw_trace))
-
-    return {
-        'detrended': detrended,
-        'baseline': baseline,
-        'cs_trace': cs_base,
-        'cs_peaks': cs_peaks,
-        'ss_trace': ss_base_clean,
-        'ss_peaks': ss_peaks,
-        'sigma_cs': sigma_cs,
-        'sigma_ss': sigma_ss,
-        'raw_sigma': global_sigma,
-        'det_method': f'Template Matching ({template_match_method})',
-        'threshold_mode': 'Sigma x MAD',
-        'parallel_match': bool(parallel_match),
-        'cs_min_fwhm_ms_used': float(cs_min_fwhm_ms),
-        'cs_threshold_used': cs_threshold_used,
-        'ss_threshold_used': ss_threshold_used,
-        'cs_similarity_trace': cs_similarity_trace,
-        'ss_similarity_trace': ss_similarity_trace,
-    }
-
-
-def process_cell_simple(raw_trace, fs, negative_going=True,
-                        cs_low_cut=0.0, cs_high_cut=150.0, cs_thresh_sigma=6.0, cs_min_dist_ms=25,
-                        cs_min_fwhm_ms=4.0,
-                        ss_low_cut=0.0, ss_high_cut=0.0, ss_thresh_sigma=2.5,
-                        ss_min_dist_ms=2, ss_blank_ms=15, ss_min_width_ms=1, ss_max_width_ms=6,
-                        use_preprocessed=False, pre_detrended=None, pre_baseline=None,
-                        pre_detrended_cs=None, pre_detrended_ss=None,
-                        initial_blank_ms=0.0, cs_order=3, ss_order=3,
-                        local_baseline=False, local_baseline_cs_ms=200.0,
-                        local_baseline_ss_ms=50.0):
-    working = raw_trace * -1 if negative_going else raw_trace
-    if use_preprocessed and pre_detrended is not None and pre_baseline is not None:
-        detrended = pre_detrended
-        baseline = pre_baseline
-    else:
-        detrended, baseline = detrend_trace(working, fs, window_sec=0.05, percentile=20)
-
-    detr_for_detection = detrended
-    try:
-        if isinstance(baseline, np.ndarray) and np.allclose(baseline, 0):
-            try:
-                detr_for_detection = apply_filter(detrended, fs, low=1.0, high=None, order=3)
-            except Exception:
-                detr_for_detection = detrended
-    except Exception:
-        detr_for_detection = detrended
-    detr_for_detection_cs = np.asarray(pre_detrended_cs, dtype=float) if pre_detrended_cs is not None else detr_for_detection
-    detr_for_detection_ss = np.asarray(pre_detrended_ss, dtype=float) if pre_detrended_ss is not None else detr_for_detection
-    global_sigma = estimate_noise_mad(detrended)
-
-    cs_trace = apply_filter(detr_for_detection_cs, fs, low=cs_low_cut, high=cs_high_cut, order=cs_order)
-    sigma_cs = estimate_noise_mad(cs_trace)
-    cs_dist = int((cs_min_dist_ms / 1000.0) * fs)
-    if cs_dist < 1:
-        cs_dist = 1
-
-    # CS threshold: local or global
-    if local_baseline:
-        cs_win_samples = max(5, int((local_baseline_cs_ms / 1000.0) * fs))
-        cs_local_sigma = estimate_noise_mad_local(cs_trace, cs_win_samples)
-        cs_threshold_trace = cs_thresh_sigma * cs_local_sigma
-        cs_candidates, _ = find_peaks(cs_trace, distance=cs_dist)
-        # filter by local threshold
-        cs_candidates = cs_candidates[cs_trace[cs_candidates] >= cs_threshold_trace[cs_candidates]]
-    else:
-        cs_threshold_trace = None
-        cs_candidates, _ = find_peaks(cs_trace, height=cs_thresh_sigma * sigma_cs, distance=cs_dist)
-
-    cs_candidates = _filter_peaks_min_fwhm(cs_trace, cs_candidates, fs, cs_min_fwhm_ms)
-
-    if initial_blank_ms is not None and initial_blank_ms > 0:
-        init_blank_samples = int((initial_blank_ms / 1000.0) * fs)
-        cs_peaks = cs_candidates[cs_candidates >= init_blank_samples]
-    else:
-        cs_peaks = cs_candidates
-
-    ss_trace = apply_filter(detr_for_detection_ss, fs, low=ss_low_cut, high=ss_high_cut, order=ss_order)
-    ss_trace_clean = ss_trace.copy()
-    blank_samples = int((ss_blank_ms / 1000.0) * fs)
-    for cs_idx in cs_peaks:
-        start = max(0, cs_idx - blank_samples // 2)
-        end = min(len(raw_trace), start + blank_samples)
-        ss_trace_clean[start:end] = 0
-
-    try:
-        nonzero = ss_trace_clean[ss_trace_clean != 0]
-        if nonzero.size > 0:
-            sigma_ss_filtered = estimate_noise_mad(nonzero)
-        else:
-            sigma_ss_filtered = estimate_noise_mad(ss_trace_clean)
-    except Exception:
-        sigma_ss_filtered = estimate_noise_mad(ss_trace_clean)
-    ss_dist = int((ss_min_dist_ms / 1000.0) * fs)
-    ss_dist = max(1, ss_dist)
-
-    # SS threshold: local or global
-    if local_baseline:
-        ss_win_samples = max(5, int((local_baseline_ss_ms / 1000.0) * fs))
-        ss_local_sigma = estimate_noise_mad_local(ss_trace_clean, ss_win_samples)
-        ss_threshold_trace = ss_thresh_sigma * ss_local_sigma
-        try:
-            ss_candidates, _ = find_peaks(ss_trace_clean, distance=ss_dist)
-            ss_candidates = ss_candidates[ss_trace_clean[ss_candidates] >= ss_threshold_trace[ss_candidates]]
-        except Exception:
-            ss_candidates = np.array([], dtype=int)
-    else:
-        ss_threshold_trace = None
-        try:
-            ss_candidates, _ = find_peaks(
-                ss_trace_clean,
-                height=ss_thresh_sigma * sigma_ss_filtered,
-                distance=ss_dist,
-            )
-        except Exception:
-            ss_candidates = np.array([], dtype=int)
-
-    if initial_blank_ms is not None and initial_blank_ms > 0:
-        init_blank_samples = int((initial_blank_ms / 1000.0) * fs)
-        ss_peaks = ss_candidates[ss_candidates >= init_blank_samples]
-    else:
-        ss_peaks = ss_candidates
-
-    result = {
-        'detrended': detrended,
-        'baseline': baseline,
-        'cs_trace': cs_trace,
-        'cs_peaks': cs_peaks,
-        'ss_trace': ss_trace_clean,
-        'ss_peaks': ss_peaks,
-        'sigma_cs': sigma_cs,
-        'sigma_ss': sigma_ss_filtered,
-        'raw_sigma': global_sigma,
-        'det_method': 'Threshold',
-        'threshold_mode': 'Sigma x MAD (local)' if local_baseline else 'Sigma x MAD',
-        'cs_min_fwhm_ms_used': float(cs_min_fwhm_ms),
-        'cs_threshold_used': float(cs_thresh_sigma * sigma_cs),
-        'ss_threshold_used': float(ss_thresh_sigma * sigma_ss_filtered),
-        'local_baseline': bool(local_baseline),
-        'ss_width_filter_enabled': False,
-        'ss_min_dist_ms_used': float(ss_min_dist_ms),
-        'ss_blank_ms_used': float(ss_blank_ms),
-        'initial_blank_ms_used': float(initial_blank_ms) if initial_blank_ms is not None else 0.0,
-    }
-    if cs_threshold_trace is not None:
-        result['cs_threshold_trace'] = cs_threshold_trace
-    if ss_threshold_trace is not None:
-        result['ss_threshold_trace'] = ss_threshold_trace
-    return result
+    cs_score, cs_candidates, cs_thr, cs_mask, cs_diagnostics = score_and_detect(cs_sim, template_cs_bank,
+        template_cs_fs_bank, cs_thresh_sigma, cs_similarity_threshold, cs_min_dist_ms, cs_mask, False,
+        cs_selected_groups, mask_is_safe=fixed_masks is not None)
+    cs_peaks = np.unique(np.clip(np.rint(cs_candidates*fs/sim_fs).astype(int), 0, len(cs)-1))
+    cs_peaks, cs_widths = _cs_width_filter(cs, cs_peaks, fs, cs_min_fwhm_ms, align_ms=2.0)
+    pre = ss_blank_ms/2 if ss_mask_pre_ms is None else ss_mask_pre_ms
+    post = ss_blank_ms/2 if ss_mask_post_ms is None else ss_mask_post_ms
+    ss_mask = (fixed_masks['ss'] if fixed_masks is not None else exclusion_mask(
+        len(ss_sim), sim_fs, np.rint(cs_peaks*sim_fs/fs).astype(int), pre, post, initial_blank_ms))
+    ss_score, ss_candidates, ss_thr, ss_mask, ss_diagnostics = score_and_detect(ss_sim, template_ss_bank,
+        template_ss_fs_bank, ss_thresh_sigma, ss_similarity_threshold, ss_min_dist_ms, ss_mask, True,
+        ss_selected_groups, mask_is_safe=fixed_masks is not None)
+    ss_peaks = np.unique(np.clip(np.rint(ss_candidates*fs/sim_fs).astype(int), 0, len(ss)-1))
+    sample_map = np.minimum(np.rint(np.arange(len(cs))*sim_fs/fs).astype(int), len(cs_sim)-1)
+    cs_mask, ss_mask = cs_mask[sample_map], ss_mask[sample_map]
+    cs_peaks, ss_peaks = cs_peaks[~cs_mask[cs_peaks]], ss_peaks[~ss_mask[ss_peaks]]
+    return dict(detrended=detrended, baseline=baseline, cs_trace=cs, ss_trace=ss,
+                cs_peaks=cs_peaks, ss_peaks=ss_peaks,
+                raw_sigma=estimate_noise_mad(detrended),
+                sigma_cs=_masked_sigma(cs, cs_mask), sigma_ss=_masked_sigma(ss, ss_mask),
+                cs_threshold_used=cs_thr, ss_threshold_used=ss_thr,
+                det_method=f'Template Matching ({"Positive-core LLR" if template_match_method == "Burst-aware LLR" else template_match_method})',
+                threshold_mode=('Pearson r + minimum response' if template_match_method == 'Normalized Similarity'
+                    else 'Positive-core LLR gain (response / per-sample MAD)² / 2' if template_match_method == 'Burst-aware LLR'
+                    else 'Amplitude-fitted LLR gain (response / per-sample MAD)² / 2'),
+                parallel_match=bool(parallel_match), cs_width_candidates=cs_widths,
+                cs_candidate_diagnostics=cs_diagnostics,
+                ss_candidate_diagnostics=ss_diagnostics,
+                cs_similarity_trace=np.interp(np.arange(len(cs))/fs, np.arange(len(cs_score))/sim_fs, cs_score),
+                ss_similarity_trace=np.interp(np.arange(len(ss))/fs, np.arange(len(ss_score))/sim_fs, ss_score),
+                cs_exclusion_mask=cs_mask, ss_exclusion_mask=ss_mask,
+                ss_mask_pre_ms_used=pre, ss_mask_post_ms_used=post,
+                template_mask_includes_support=True, width_alignment_ms=2.0,
+                template_ss_lowpass_hz_used=lowpass_used,
+                cs_min_filtered_peak_sigma_used=float(cs_min_filtered_peak_sigma))
 
 
 def get_interpolated_wave(wave, fs, upscale_factor=10):
@@ -889,7 +918,8 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
             return snr_list
 
         n = int(trace.size)
-        non_spike_mask = np.ones(n, dtype=bool)
+        exclusion = np.asarray(res.get(st.lower() + '_exclusion_mask', np.zeros(n, dtype=bool)), dtype=bool)
+        non_spike_mask = ~exclusion.copy()
         if st == 'SS':
             _mark_exclusion(non_spike_mask, ss_peaks, pre_ms=2.0, post_ms=4.0, n_total=n)
             _mark_exclusion(non_spike_mask, cs_peaks, pre_ms=8.0, post_ms=30.0, n_total=n)
@@ -903,7 +933,7 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
 
         global_sigma = _robust_sigma(trace[non_spike_mask])
         if not np.isfinite(global_sigma) or global_sigma <= 0:
-            global_sigma = _robust_sigma(trace)
+            global_sigma = _robust_sigma(trace[~exclusion])
         if not np.isfinite(global_sigma) or global_sigma <= 0:
             return snr_list
 
