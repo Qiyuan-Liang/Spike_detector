@@ -5,6 +5,15 @@ from scipy.stats import median_abs_deviation
 
 TEMPLATE_TARGET_FS = 5000.0
 
+# Shared by CS/SS event statistics and written to exported analysis settings.
+EVENT_SNR_POLICY = dict(amplitude_baseline_interval_ms=[-25.0, -5.0],
+    noise_estimation_interval_ms=[-150.0, -5.0],
+    ss_exclusion_interval_ms=[-2.0, 4.0], cs_exclusion_interval_ms=[-9.0, 18.0],
+    baseline_masks_detected_events=True, min_baseline_samples=3,
+    noise_min_samples=20, noise_min_duration_ms=5.0,
+    noise_fallback='recording-wide masked MAD, then detector-eligible MAD',
+    unavailable='NaN in event order; excluded from summary statistics')
+
 
 def estimate_noise_mad(trace):
     try:
@@ -16,7 +25,7 @@ def estimate_noise_mad(trace):
     try:
         std = float(np.nanstd(trace))
         if np.isfinite(std) and std > 0:
-            return std * 0.6745
+            return std
     except Exception:
         pass
     return 1e-6
@@ -279,7 +288,7 @@ def _compute_llr_from_template_bank(trace, template_bank, fs_bank, fs, force_pea
     return _llr_probability_vector(x, mu_signal, sigma_signal, mu_noise, sigma_noise)
 
 
-def _similarity_score(trace, template_bank, fs_bank, fs, short_core=False):
+def _similarity_score(trace, template_bank, fs_bank, fs, short_core=False, whitening=None):
     """Pearson similarity and fitted positive response for an event-centred template.
 
     A short SS core permits truncated recovery tails in rapid bursts. The fitted
@@ -297,6 +306,10 @@ def _similarity_score(trace, template_bank, fs_bank, fs, short_core=False):
         mu = mu[lo:lo + length]
     m = mu.size
     kernel = mu - np.mean(mu)
+    if whitening is not None:
+        from .whitening import whiten_kernel
+        kernel = whiten_kernel(kernel, whitening)
+        m = kernel.size
     norm = float(np.linalg.norm(kernel))
     if norm < 1e-9:
         return np.zeros_like(x), np.zeros_like(x), m // 2
@@ -309,19 +322,19 @@ def _similarity_score(trace, template_bank, fs_bank, fs, short_core=False):
     return similarity, response, m // 2
 
 
-def _amplitude_fitted_llr_score(trace, template_bank, fs_bank, fs, noise_mask, short_core=False):
+def _amplitude_fitted_llr_score(trace, template_bank, fs_bank, fs, noise_mask, short_core=False, whitening=None):
     """Positive-amplitude Gaussian GLRT gain for a bank's mean waveform.
 
     Fitting the amplitude prevents pooled bright-cell templates from rejecting
     same-shaped events in dim cells. A short SS core tolerates burst overlap.
     """
-    similarity, response, support = _similarity_score(trace, template_bank, fs_bank, fs, short_core)
+    similarity, response, support = _similarity_score(trace, template_bank, fs_bank, fs, short_core, whitening)
     sigma = max(float(_masked_sigma(trace, noise_mask)), 1e-9)
     z = np.maximum(response, 0.0) / sigma
     return 0.5 * z * z, response, similarity, support
 
 
-def _positive_core_ss_score(trace, template_bank, fs_bank, fs, noise_mask):
+def _positive_core_ss_score(trace, template_bank, fs_bank, fs, noise_mask, whitening=None):
     """Fit a positive SS core without imposing a neighboring-event prior.
 
     The baseline-corrected trace has zero as its null mean. Clipping negative
@@ -336,6 +349,10 @@ def _positive_core_ss_score(trace, template_bank, fs_bank, fs, noise_mask):
     center = mu.size // 2
     start = min(max(0, center - length // 2), mu.size - length)
     core = np.maximum(mu[start:start + length], 0.0)
+    if whitening is not None:
+        from .whitening import whiten_kernel
+        core = whiten_kernel(core, whitening)
+        length = len(core)
     norm = float(np.linalg.norm(core))
     if norm < 1e-9:
         return np.zeros_like(x), np.zeros_like(x), length // 2
@@ -566,6 +583,9 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
                         initial_blank_ms=0.0, cs_order=3, ss_order=3,
                         local_baseline=False, local_baseline_cs_ms=200.0, local_baseline_ss_ms=50.0,
                         ss_mask_pre_ms=None, ss_mask_post_ms=None):
+    for value in (cs_thresh_sigma, ss_thresh_sigma):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError('Threshold cutoffs must be finite and nonnegative; 0 disables that type.')
     detrended, baseline, cs, ss = _prepare_detection(raw_trace, fs, negative_going, use_preprocessed,
         pre_detrended, pre_baseline, pre_detrended_cs, pre_detrended_ss)
     cs = apply_filter(cs, fs, cs_low_cut, cs_high_cut, cs_order)
@@ -573,22 +593,25 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
     cs_mask = exclusion_mask(len(cs), fs, initial_ms=initial_blank_ms)
     sigma_cs = _masked_sigma(cs, cs_mask)
     cs_threshold = cs_thresh_sigma * (_masked_local_sigma(cs, cs_mask, local_baseline_cs_ms*fs/1000)
-                                     if local_baseline else sigma_cs)
-    cs_peaks = _select_peaks(cs, cs_threshold, max(1, int(np.ceil(cs_min_dist_ms*fs/1000))), cs_mask)
+                                     if local_baseline else sigma_cs) if cs_thresh_sigma > 0 else (np.zeros_like(cs) if local_baseline else 0.0)
+    cs_peaks = (_select_peaks(cs, cs_threshold, max(1, int(np.ceil(cs_min_dist_ms*fs/1000))), cs_mask)
+                if cs_thresh_sigma > 0 else np.array([], dtype=int))
     cs_peaks, cs_widths = _cs_width_filter(cs, cs_peaks, fs, cs_min_fwhm_ms)
     pre = ss_blank_ms/2 if ss_mask_pre_ms is None else ss_mask_pre_ms
     post = ss_blank_ms/2 if ss_mask_post_ms is None else ss_mask_post_ms
     ss_mask = exclusion_mask(len(ss), fs, cs_peaks, pre, post, initial_blank_ms)
     sigma_ss = _masked_sigma(ss, ss_mask)
     ss_threshold = ss_thresh_sigma * (_masked_local_sigma(ss, ss_mask, local_baseline_ss_ms*fs/1000)
-                                     if local_baseline else sigma_ss)
-    ss_peaks = _select_peaks(ss, ss_threshold, max(1, int(np.ceil(ss_min_dist_ms*fs/1000))), ss_mask)
+                                     if local_baseline else sigma_ss) if ss_thresh_sigma > 0 else (np.zeros_like(ss) if local_baseline else 0.0)
+    ss_peaks = (_select_peaks(ss, ss_threshold, max(1, int(np.ceil(ss_min_dist_ms*fs/1000))), ss_mask)
+                if ss_thresh_sigma > 0 else np.array([], dtype=int))
     result = dict(detrended=detrended, baseline=baseline, cs_trace=cs, ss_trace=ss,
                   cs_peaks=cs_peaks, ss_peaks=ss_peaks, sigma_cs=sigma_cs, sigma_ss=sigma_ss,
                   raw_sigma=estimate_noise_mad(detrended), det_method='Threshold',
+                  cs_detection_enabled=bool(cs_thresh_sigma > 0), ss_detection_enabled=bool(ss_thresh_sigma > 0),
                   threshold_mode='Sigma x MAD (local)' if local_baseline else 'Sigma x MAD',
-                  local_baseline=bool(local_baseline), cs_threshold_used=cs_thresh_sigma*sigma_cs,
-                  ss_threshold_used=ss_thresh_sigma*sigma_ss, cs_width_candidates=cs_widths,
+                  local_baseline=bool(local_baseline), cs_threshold_used=cs_thresh_sigma*sigma_cs if cs_thresh_sigma > 0 else 0.0,
+                  ss_threshold_used=ss_thresh_sigma*sigma_ss if ss_thresh_sigma > 0 else 0.0, cs_width_candidates=cs_widths,
                   cs_exclusion_mask=cs_mask, ss_exclusion_mask=ss_mask,
                   ss_mask_pre_ms_used=pre, ss_mask_post_ms_used=post)
     if local_baseline:
@@ -614,7 +637,9 @@ def process_cell_template_matching(raw_trace, fs,
                                    fixed_exclusion_masks=None,
                                    parallel_groups=3, parallel_components=2,
                                    cs_selected_groups=None, ss_selected_groups=None,
-                                   cs_min_filtered_peak_sigma=3.0):
+                                   cs_min_filtered_peak_sigma=3.0,
+                                   ss_mask_reference_cs=None,
+                                   template_whitening=False, fixed_whitening=None):
     if template_match_method not in ('LLR Probability Vector', 'Normalized Similarity', 'Burst-aware LLR'):
         raise ValueError('Unsupported template match method.')
     for val in (cs_similarity_threshold, ss_similarity_threshold):
@@ -647,9 +672,12 @@ def process_cell_template_matching(raw_trace, fs,
             fixed_masks[kind] = native[sample_map_sim]
     cs_mask = (fixed_masks['cs'] if fixed_masks is not None else
                exclusion_mask(len(cs_sim), sim_fs, initial_ms=initial_blank_ms))
+    whitening_states, whitening_info = {}, {}
 
     def score_and_detect(trace, bank, rates, sigma, similarity_threshold, spacing, mask, short_core,
                          selected_groups, mask_is_safe=False):
+        kind = 'ss' if short_core else 'cs'
+        whitening_info[kind] = dict(applied=False, reason='disabled' if not template_whitening else 'no templates')
         if bank is None or len(bank) == 0:
             return np.zeros_like(trace), np.array([], dtype=int), np.nan, mask, dict(
                 score_peaks=0, masked=0, response_rejected=0, peak_rejected=0,
@@ -676,6 +704,23 @@ def process_cell_template_matching(raw_trace, fs,
         if short_core:
             support = min(support, max(5, int(round(0.003 * sim_fs)) | 1)//2)
         from scipy.ndimage import maximum_filter1d
+        original_trace = trace
+        whitening = None
+        if template_whitening:
+            from .whitening import fit_whitening, whiten_trace
+            if fixed_whitening is not None and kind in fixed_whitening:
+                state = fixed_whitening[kind]
+                if np.asarray(state['noise_mask']).shape != trace.shape:
+                    raise ValueError('Frozen whitening mask must match the scoring trace.')
+            else:
+                state = fit_whitening(trace, sim_fs, mask, kind)
+            whitening_states[kind] = state
+            whitening_info[kind] = dict(state['info'])
+            if state['info']['applied']:
+                whitening = state
+                # Both the trace FIR and the whitened kernel contribute support.
+                support += len(state['fir']) - 1
+                trace = whiten_trace(trace, state)
         if mask_is_safe:
             safe_mask = mask.copy()
         else:
@@ -683,18 +728,40 @@ def process_cell_template_matching(raw_trace, fs,
             safe_mask[:support] = True
             if support:
                 safe_mask[-support:] = True
-        response_floor = max(similarity_min_response_sigma, 3.0 if not short_core else 0.0) * _masked_sigma(trace, safe_mask)
+        noise_mask = safe_mask
+        if whitening is not None:
+            radius = len(whitening['fir'])//2
+            noise_mask = safe_mask | (maximum_filter1d(whitening['noise_mask'].astype(np.uint8),
+                size=2*radius+1, mode='constant') > 0)
+            # A noise fit can succeed yet leave too little uncontaminated
+            # background after FIR padding. Fall back explicitly, never to zero.
+            if np.count_nonzero(~noise_mask) < 32:
+                whitening_info[kind].update(applied=False, reason='insufficient background after FIR padding')
+                state = dict(fir=np.ones(1), noise_mask=mask.copy(), info=whitening_info[kind])
+                whitening_states[kind] = state
+                support -= 2*radius
+                whitening = None
+                trace = original_trace
+                if not mask_is_safe:
+                    safe_mask = maximum_filter1d(mask.astype(np.uint8), size=2*support+1, mode='constant') > 0
+                    safe_mask[:support] = True
+                    if support:
+                        safe_mask[-support:] = True
+                noise_mask = safe_mask
+        noise_sigma = _masked_sigma(trace, noise_mask)
+        whitening_info[kind]['score_noise_mad'] = float(noise_sigma) if np.isfinite(noise_sigma) else None
+        response_floor = max(similarity_min_response_sigma, 3.0 if not short_core else 0.0) * noise_sigma
         for bk, br in banks:
             if template_match_method == 'Normalized Similarity':
-                score, response, _ = _similarity_score(trace, bk, br, sim_fs, short_core)
+                score, response, _ = _similarity_score(trace, bk, br, sim_fs, short_core, whitening)
                 threshold = similarity_threshold
             elif template_match_method == 'Burst-aware LLR' and short_core:
                 score, response, _ = _positive_core_ss_score(
-                    trace, bk, br, sim_fs, safe_mask)
+                    trace, bk, br, sim_fs, noise_mask, whitening)
                 threshold = 0.5 * float(sigma)**2
             else:
                 score, response, _, _ = _amplitude_fitted_llr_score(
-                    trace, bk, br, sim_fs, safe_mask, short_core)
+                    trace, bk, br, sim_fs, noise_mask, short_core, whitening)
                 # Map the user-selected matched-response ratio to its GLRT gain.
                 # This is not a calibrated false-positive probability.
                 threshold = 0.5 * float(sigma)**2
@@ -709,9 +776,9 @@ def process_cell_template_matching(raw_trace, fs,
             if not short_core and cs_min_filtered_peak_sigma > 0:
                 # A long CS template can match slow baseline structure. Require
                 # an actual local deflection as well as integrated evidence.
-                cs_height_floor = cs_min_filtered_peak_sigma * _masked_sigma(trace, safe_mask)
-                diagnostics['peak_rejected'] += int(np.count_nonzero(trace[found] < cs_height_floor))
-                found = found[trace[found] >= cs_height_floor]
+                cs_height_floor = cs_min_filtered_peak_sigma * _masked_sigma(original_trace, safe_mask)
+                diagnostics['peak_rejected'] += int(np.count_nonzero(original_trace[found] < cs_height_floor))
+                found = found[original_trace[found] >= cs_height_floor]
             candidates.extend(found)
         score = np.maximum.reduce([s - t for s, t in zip(scores, thresholds)]) if len(scores) > 1 else scores[0]
         display_threshold = 0.0 if len(scores) > 1 else thresholds[0]
@@ -730,8 +797,10 @@ def process_cell_template_matching(raw_trace, fs,
     cs_peaks, cs_widths = _cs_width_filter(cs, cs_peaks, fs, cs_min_fwhm_ms, align_ms=2.0)
     pre = ss_blank_ms/2 if ss_mask_pre_ms is None else ss_mask_pre_ms
     post = ss_blank_ms/2 if ss_mask_post_ms is None else ss_mask_post_ms
+    mask_cs_peaks = cs_peaks if ss_mask_reference_cs is None else np.unique(
+        np.r_[cs_peaks, np.asarray(ss_mask_reference_cs, dtype=int)])
     ss_mask = (fixed_masks['ss'] if fixed_masks is not None else exclusion_mask(
-        len(ss_sim), sim_fs, np.rint(cs_peaks*sim_fs/fs).astype(int), pre, post, initial_blank_ms))
+        len(ss_sim), sim_fs, np.rint(mask_cs_peaks*sim_fs/fs).astype(int), pre, post, initial_blank_ms))
     ss_score, ss_candidates, ss_thr, ss_mask, ss_diagnostics = score_and_detect(ss_sim, template_ss_bank,
         template_ss_fs_bank, ss_thresh_sigma, ss_similarity_threshold, ss_min_dist_ms, ss_mask, True,
         ss_selected_groups, mask_is_safe=fixed_masks is not None)
@@ -757,6 +826,8 @@ def process_cell_template_matching(raw_trace, fs,
                 ss_mask_pre_ms_used=pre, ss_mask_post_ms_used=post,
                 template_mask_includes_support=True, width_alignment_ms=2.0,
                 template_ss_lowpass_hz_used=lowpass_used,
+                template_whitening=dict(requested=bool(template_whitening), **whitening_info),
+                _template_whitening=whitening_states,
                 cs_min_filtered_peak_sigma_used=float(cs_min_filtered_peak_sigma))
 
 
@@ -861,8 +932,9 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
     """Compute per-event SNR using robust local noise windows with spike masking.
 
     Parameters kept for compatibility:
-    - window_ms is currently unused by design (type-specific windows are fixed).
+    - window_ms is unused by design (shared intervals are in EVENT_SNR_POLICY).
     - trace_override allows callers to enforce a unified waveform source trace.
+    - unavailable estimates are NaN, preserving the selected event order.
     """
     snr_list = []
     if res is None:
@@ -920,31 +992,29 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
         n = int(trace.size)
         exclusion = np.asarray(res.get(st.lower() + '_exclusion_mask', np.zeros(n, dtype=bool)), dtype=bool)
         non_spike_mask = ~exclusion.copy()
-        if st == 'SS':
-            _mark_exclusion(non_spike_mask, ss_peaks, pre_ms=2.0, post_ms=4.0, n_total=n)
-            _mark_exclusion(non_spike_mask, cs_peaks, pre_ms=8.0, post_ms=30.0, n_total=n)
-            base_pre_ms, base_post_ms = 5.0, 1.0
-            noise_pre_ms, noise_post_ms = 50.0, 5.0
-        else:
-            _mark_exclusion(non_spike_mask, ss_peaks, pre_ms=3.0, post_ms=5.0, n_total=n)
-            _mark_exclusion(non_spike_mask, cs_peaks, pre_ms=20.0, post_ms=80.0, n_total=n)
-            base_pre_ms, base_post_ms = 20.0, 5.0
-            noise_pre_ms, noise_post_ms = 150.0, 20.0
+        ss_interval = EVENT_SNR_POLICY['ss_exclusion_interval_ms']
+        cs_interval = EVENT_SNR_POLICY['cs_exclusion_interval_ms']
+        _mark_exclusion(non_spike_mask, ss_peaks, pre_ms=-ss_interval[0], post_ms=ss_interval[1], n_total=n)
+        _mark_exclusion(non_spike_mask, cs_peaks, pre_ms=-cs_interval[0], post_ms=cs_interval[1], n_total=n)
+        base_pre_ms, base_post_ms = [-v for v in EVENT_SNR_POLICY['amplitude_baseline_interval_ms']]
+        noise_pre_ms, noise_post_ms = [-v for v in EVENT_SNR_POLICY['noise_estimation_interval_ms']]
+        chosen = _select_event_bank(peaks, max_per_cell=max_per_cell)
 
         global_sigma = _robust_sigma(trace[non_spike_mask])
         if not np.isfinite(global_sigma) or global_sigma <= 0:
             global_sigma = _robust_sigma(trace[~exclusion])
         if not np.isfinite(global_sigma) or global_sigma <= 0:
-            return snr_list
+            return [np.nan] * len(chosen)
 
-        chosen = _select_event_bank(peaks, max_per_cell=max_per_cell)
         base_pre = _ms_to_samples(base_pre_ms)
         base_post = _ms_to_samples(base_post_ms)
         noise_pre = _ms_to_samples(noise_pre_ms)
         noise_post = _ms_to_samples(noise_post_ms)
-        min_clean = max(20, _ms_to_samples(5.0))
+        min_clean = max(EVENT_SNR_POLICY['noise_min_samples'], _ms_to_samples(EVENT_SNR_POLICY['noise_min_duration_ms']))
 
         for p in chosen:
+            # Keep unavailable metrics aligned with their event timestamps.
+            snr_list.append(np.nan)
             pi = int(p)
             if pi < 0 or pi >= n:
                 continue
@@ -953,10 +1023,11 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
             b1 = max(0, pi - base_post)
             if b1 <= b0:
                 continue
-            baseline_seg = trace[b0:b1]
-            if baseline_seg.size <= 0:
+            baseline_seg = trace[b0:b1][non_spike_mask[b0:b1]]
+            baseline_seg = baseline_seg[np.isfinite(baseline_seg)]
+            if baseline_seg.size < EVENT_SNR_POLICY['min_baseline_samples']:
                 continue
-            baseline_i = float(np.median(baseline_seg[np.isfinite(baseline_seg)])) if np.any(np.isfinite(baseline_seg)) else np.nan
+            baseline_i = float(np.median(baseline_seg))
             if not np.isfinite(baseline_i):
                 continue
             amplitude_i = float(trace[pi] - baseline_i)
@@ -981,7 +1052,7 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
 
             snr_i = amplitude_i / sigma_i
             if np.isfinite(snr_i):
-                snr_list.append(float(snr_i))
+                snr_list[-1] = float(snr_i)
     except Exception:
         pass
     return snr_list

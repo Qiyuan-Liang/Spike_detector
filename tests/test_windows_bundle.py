@@ -31,7 +31,10 @@ class WindowsBundleTests(unittest.TestCase):
             self.assertIn('src/spike_detector/utils/validation.py', names)
             self.assertIn('src/spike_detector/utils/widths.py', names)
             self.assertIn('src/spike_detector/utils/batch.py', names)
+            self.assertIn('src/spike_detector/assets/spike_detector_macos.png', names)
             self.assertIn('build_windows_uv.bat', names)
+            for extension in ('png', 'ico', 'icns'):
+                self.assertIn(f'src/spike_detector/assets/spike_detector.{extension}', names)
             self.assertIn('spike_detector_launcher.py', names)
             self.assertTrue(all(name.startswith(('src/spike_detector/', 'scripts/', 'packaging/pyinstaller/')) or
                                 name in {'.python-version','pyproject.toml','requirements.txt','README.md',
@@ -59,6 +62,8 @@ class WindowsBundleTests(unittest.TestCase):
             batch = archive.read('build_windows_uv.bat').decode()
             launcher = archive.read('spike_detector_launcher.py').decode()
         self.assertIn('COLLECT(', spec)
+        self.assertIn("ASSETS / 'spike_detector.ico'", spec)
+        self.assertIn("ASSETS / 'spike_detector.icns'", spec)
         self.assertIn("ROOT / 'spike_detector_launcher.py'", spec)
         self.assertNotIn('gui_preprocess_V3.3.py', spec)
         self.assertIn('from spike_detector.gui import main', launcher)

@@ -6,18 +6,22 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
 from PyQt6 import QtWidgets
 from spike_detector.gui import (MainWindow, StatsViewerDialog, DetectionViewerDialog,
     BatchDetectionDialog, DetectionSettingsDialog, SettingsDialog, DenoisingSettingsDialog)
+from spike_detector.gui import estimate_noise_mad as gui_noise_mad
 from spike_detector.utils.session import normalize_time_and_fs, load_session_path
 from spike_detector.utils.batch import discover_batch_sessions
 from spike_detector.utils.validation import validate_time, effective_settings, mask_windows
 from spike_detector.utils.widths import measure_width, measure_widths
 from spike_detector.utils.stats import autocorrelogram_counts
 from spike_detector.utils.processing import (process_cell_simple, process_cell_template_matching,
-    _build_parallel_template_banks, apply_filter, exclusion_mask)
+    _build_parallel_template_banks, apply_filter, exclusion_mask,
+    estimate_noise_mad as processing_noise_mad)
 
 
 class ScienceTests(unittest.TestCase):
@@ -290,6 +294,235 @@ class ScienceGuiTests(unittest.TestCase):
         finally:
             for dialog in dialogs:
                 dialog.close()
+
+    def test_excel_untimed_tail_loads_timed_prefix_with_explicit_warning(self):
+        path = Path(self.temp.name) / 'mixed_length.xlsx'
+        timed = pd.DataFrame({
+            't(ms)': np.arange(160) * 0.12,
+            'cell_A': np.sin(np.arange(160)),
+            'cell_B': np.cos(np.arange(160)),
+        })
+        timed.to_excel(path, sheet_name='Sheet1', index=False)
+        book = load_workbook(path)
+        sheet = book['Sheet1']
+        for value in range(12):
+            sheet.append([None, None, float(value)])
+        book.save(path)
+
+        data = load_session_path(str(path))
+        self.assertEqual(data['raw_data'].shape, (160, 2))
+        self.assertAlmostEqual(data['fs'], 1000 / 0.12)
+        self.assertEqual(data['ignored_untimed_tail_rows'], 12)
+        self.assertIn('cell_B: 12', data['load_warnings'][0])
+        self.win.master_folder = self.temp.name
+        self.win.refresh_sessions()
+        self.assertIn('Input warning: Excluded 12 rows', self.win.text_stats.toPlainText())
+        _, _, _, issues, _ = discover_batch_sessions([self.temp.name])
+        self.assertTrue(any('Input warning:' in issue and 'cell_B: 12' in issue for issue in issues))
+
+        sheet.cell(row=80, column=1).value = None
+        book.save(path)
+        with self.assertRaisesRegex(ValueError, 'finite samples'):
+            load_session_path(str(path))
+
+    def test_excel_lock_files_are_ignored_but_corrupt_workbooks_still_reported(self):
+        root = Path(self.temp.name)
+        real = root / 'BestSS.xlsx'
+        pd.DataFrame({'time_ms': np.arange(160), 'cell': np.sin(np.arange(160))}).to_excel(real, index=False)
+        locks = [root/'~$BestSS.xlsx', root/'~$BestSS_ASAP7.XLSX']
+        for path in locks:
+            path.write_bytes(b'Excel owner file, not a ZIP archive')
+        bad = root/'zz_bad.xlsx'
+        bad.write_bytes(b'corrupt real workbook')
+        self.assertEqual(self.win._list_table_files_in_dir(str(root)), [str(real), str(bad)])
+        self.assertEqual(load_session_path(str(root))['session_path'], str(real))
+        for path in locks:
+            with patch('spike_detector.utils.session.pd.read_excel') as reader:
+                with self.assertRaisesRegex(ValueError, 'lock file'):
+                    load_session_path(str(path))
+                reader.assert_not_called()
+        self.win.master_folder = str(root)
+        self.win.refresh_sessions()
+        self.assertEqual(self.win.sessions, [str(real)])
+        self.assertIn('skipped invalid: 1', self.win.statusBar().currentMessage())
+        self.assertNotIn('~$', self.win.text_stats.toPlainText())
+        paths, _, _, issues, _ = discover_batch_sessions([str(root)])
+        self.assertEqual(paths, [str(real.resolve())])
+        self.assertEqual(len(issues), 1)
+        self.assertIn('zz_bad.xlsx', issues[0])
+        self.assertNotIn('~$', issues[0])
+        self.assertTrue(all(path.exists() for path in locks))
+
+    def test_save_load_restores_all_setting_groups_and_template_sources(self):
+        root = Path(self.temp.name)
+        cs_file = root / 'cs_templates.npz'
+        ss_file = root / 'ss_templates.npz'
+        np.savez(cs_file, template_cs=np.arange(21, dtype=float), fs_cs=1000.0)
+        np.savez(ss_file, template_ss=np.arange(11, dtype=float), fs_ss=1000.0)
+        for kind, source in (('CS', cs_file), ('SS', ss_file)):
+            self.win._merge_templates_for_type(kind, self.win._read_template_npz(source), str(source))
+
+        self.win.spin_cs_order.setValue(5)
+        self.win.spin_ss_order.setValue(6)
+        self.win.spin_cs_low.setValue(12)
+        self.win.spin_cs_high.setValue(120)
+        self.win.spin_cs_thresh.setValue(8)
+        self.win.spin_ss_low.setValue(10)
+        self.win.spin_ss_high.setValue(500)
+        self.win.spin_ss_thresh.setValue(4.5)
+        self.win.chk_template_parallel.setChecked(True)
+        self.win.chk_template_whitening.setChecked(True)
+        self.win.chk_combo.setChecked(True)
+        self.win.spin_template_groups.setValue(4)
+        self.win.combo_template_method.setCurrentIndex(1)
+        self.win.spin_template_cs_sigma.setValue(9)
+        self.win.spin_template_cs_peak.setValue(4)
+        self.win.spin_template_ss_sigma.setValue(7)
+        self.win.spin_template_cs_sim.setValue(0.85)
+        self.win.spin_template_ss_sim.setValue(0.75)
+        self.win.spin_template_min_response.setValue(3)
+        self.win.spin_template_lowpass.setValue(650)
+        self.win.chk_local_baseline.setChecked(True)
+        self.win.spin_local_ss_ms.setValue(60)
+        self.win.spin_local_cs_ms.setValue(220)
+        self.win.chk_detection_save.setChecked(True)
+        self.win.combo_baseline_method.setCurrentText('Percentile')
+        self.win.spin_baseline_window.setValue(35)
+        self.win.spin_baseline_percentile.setValue(31)
+        self.win.combo_frame_processing.setCurrentText('Downsampling frames')
+        self.win.spin_avg_frames.setValue(3)
+        self.win.slider_time.setValue(200)
+        self.win.spin_window.setValue(750)
+        self.win.spin_zoom.setValue(8)
+        self.win.chk_show_baseline.setChecked(True)
+        self.win.chk_show_cs.setChecked(True)
+        self.win.tabs_detection.setCurrentIndex(1)
+        self.win.chk_denoise.setChecked(True)
+        advanced = SettingsDialog(self.win)
+        self.win.btn_polarity_positive.click()
+        advanced.chk_denoise_cs.setChecked(True)
+        advanced.spin_cs_mind.setValue(31)
+        advanced.spin_cs_min_fwhm.setValue(7)
+        advanced.spin_ss_mind.setValue(5)
+        advanced.spin_ss_mask_pre.setValue(7)
+        advanced.spin_ss_mask_post.setValue(13)
+        advanced.chk_ss_max_fwhm.setChecked(False)
+        advanced.spin_ss_max_fwhm.setValue(5.5)
+        advanced.spin_initial_blank.setValue(180)
+        advanced.spin_tpl_cs_window.setValue(40)
+        advanced.spin_tpl_ss_window.setValue(12)
+        advanced.spin_template_components.setValue(3)
+        advanced.spin_line_scale.setValue(1.3)
+        advanced.combo_raw_scale_unit.setCurrentIndex(1)
+        advanced.save_and_close()
+        advanced.close()
+        denoise = DenoisingSettingsDialog(self.win)
+        denoise._preview_timer.stop()
+        denoise.spin_preview_window.setValue(300)
+        denoise.spin_f_min.setValue(4)
+        denoise.spin_f_max.setValue(900)
+        denoise.spin_n_freqs.setValue(64)
+        denoise.spin_min_clusters.setValue(3)
+        denoise.spin_max_clusters.setValue(15)
+        denoise.spin_pca.setValue(12)
+        denoise.spin_thr_sigma.setValue(2.5)
+        denoise.spin_att_min.setValue(0.4)
+        denoise.chk_soft.setChecked(True)
+        denoise.spin_cycles.setValue(1.5)
+        denoise.spin_max_tp.setValue(15000)
+        denoise.chk_event_refine.setChecked(False)
+        denoise.spin_evt_win.setValue(25)
+        denoise.spin_evt_sigma.setValue(3)
+        denoise.spin_evt_z.setValue(-1.2)
+        denoise.spin_evt_att.setValue(0.7)
+        denoise.save_and_accept()
+        denoise._preview_timer.stop()
+        denoise.close()
+        stats_data = {'raw_data': np.zeros((300, 1)), 'time_ms': np.arange(300),
+                      'cell_names': ['Cell'], 'fs': 1000.0, 'results': [None]}
+        stats = StatsViewerDialog(stats_data, self.win)
+        stats.spin_cs_acg_window.setValue(800)
+        stats.spin_cs_acg_bin.setValue(20)
+        stats.spin_ss_acg_window.setValue(80)
+        stats.spin_ss_acg_bin.setValue(2)
+        stats.spin_cs_bg_alpha.setValue(0.4)
+        stats.spin_ss_bg_alpha.setValue(0.004)
+        stats.close()
+        self.win.params.update({
+            'TEMPLATE_CS_SELECTED_GROUPS': [1, 3],
+        })
+        self.win.colors['cs_trace'] = '#123456'
+        expected = self.win._current_settings_snapshot()
+        path = root / 'settings.json'
+        with patch('spike_detector.gui.QFileDialog.getSaveFileName', return_value=(str(path), '')), \
+             patch('spike_detector.gui.QMessageBox.information'):
+            self.win.save_all_settings()
+        self.assertEqual(json.loads(path.read_text()), expected)
+
+        self.win.spin_cs_order.setValue(2)
+        self.win.spin_ss_order.setValue(2)
+        self.win.chk_template_parallel.setChecked(False)
+        self.win.chk_template_whitening.setChecked(False)
+        self.win.chk_combo.setChecked(False)
+        self.win.spin_template_groups.setValue(2)
+        self.win.slider_time.setValue(0)
+        self.win.spin_baseline_percentile.setValue(20)
+        self.win.chk_denoise.setChecked(False)
+        self.win.params.update({
+            'SS_MASK_PRE_MS': 2.0, 'SS_MASK_POST_MS': 2.0,
+            'DENOISE_THRESHOLD_SIGMA': 1.0, 'DENOISE_SOFT_THRESHOLD': False,
+            'STATS_CS_ACG_WINDOW_MS': 1000.0, 'STATS_SS_ACG_BIN_MS': 1.0,
+            'RAW_SCALE_BAR_UNIT': 'Sigma', 'LINE_WIDTH_SCALE': 0.7,
+        })
+        self.win.colors['cs_trace'] = '#ffffff'
+        self.win.clear_templates()
+        with patch('spike_detector.gui.QFileDialog.getOpenFileName', return_value=(str(path), '')), \
+             patch('spike_detector.gui.QMessageBox.information') as loaded, \
+             patch('spike_detector.gui.QMessageBox.critical') as failed:
+            self.win.load_all_settings()
+        failed.assert_not_called()
+        loaded.assert_called_once()
+        self.assertEqual(self.win._current_settings_snapshot(), expected)
+        self.assertEqual(len(self.win.template_store['cs_templates']), 1)
+        self.assertEqual(len(self.win.template_store['ss_templates']), 1)
+        advanced = SettingsDialog(self.win)
+        self.assertEqual(advanced.spin_cs_mind.value(), 31)
+        self.assertEqual(advanced.spin_ss_mask_post.value(), 13)
+        self.assertEqual(advanced.combo_raw_scale_unit.currentData(), 'dF/F (%)')
+        advanced.close()
+        denoise = DenoisingSettingsDialog(self.win)
+        denoise._preview_timer.stop()
+        self.assertEqual(denoise.spin_thr_sigma.value(), 2.5)
+        self.assertTrue(denoise.chk_soft.isChecked())
+        denoise.close()
+        stats = StatsViewerDialog(stats_data, self.win)
+        self.assertEqual(stats.spin_ss_acg_bin.value(), 2)
+        self.assertEqual(stats.spin_cs_bg_alpha.value(), 0.4)
+        stats.close()
+        cs_file.unlink()
+        with patch('spike_detector.gui.QFileDialog.getOpenFileName', return_value=(str(path), '')), \
+             patch('spike_detector.gui.QMessageBox.information') as loaded:
+            self.win.load_all_settings()
+        self.assertIn('Could not restore template sources', loaded.call_args.args[2])
+        self.assertEqual(len(self.win.template_store['cs_templates']), 0)
+        self.assertEqual(len(self.win.template_store['ss_templates']), 1)
+
+    def test_detection_viewer_sigma_bar_uses_normal_scaled_mad(self):
+        signal = np.array([0.0, 0.0, 0.0, 1.0])
+        self.assertAlmostEqual(gui_noise_mad(signal), float(np.std(signal)))
+        self.assertAlmostEqual(processing_noise_mad(signal), float(np.std(signal)))
+        data = {'raw_data': np.zeros((300, 1)), 'time_ms': np.arange(300),
+                'cell_names': ['Cell'], 'fs': 1000.0, 'results': [None]}
+        viewer = DetectionViewerDialog(data, self.win)
+        try:
+            viewer.ax_raw_bot.clear()
+            viewer._draw_classic_scale_bar(viewer.ax_raw_bot, 500, (0, 10), 2.0)
+            label = viewer.ax_raw_bot.texts[-1].get_text()
+            self.assertIn(r'\sigma_{\mathrm{MAD}}', label)
+            bar_fraction = np.ptp(viewer.ax_raw_bot.lines[0].get_ydata())
+            self.assertAlmostEqual(bar_fraction * 10, float(label.split()[0]) * 2.0)
+        finally:
+            viewer.close()
 
     def test_folder_skips_auxiliary_tables_and_failed_viewer_cell_is_safe(self):
         root = Path(self.temp.name)

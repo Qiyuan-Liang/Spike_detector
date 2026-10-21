@@ -1,10 +1,11 @@
-"""Folder discovery for batch detection; no detection or output writes here."""
+"""Batch folder discovery and cleanup of recognized obsolete viewing exports."""
 import os
 from pathlib import Path
 
 import numpy as np
 
-from .session import load_session_path
+from .session import load_session_path, is_excel_lock_file
+from .results import cleanup_legacy_temporaries
 
 
 def normalize_folder_paths(paths, base_dir=None):
@@ -32,6 +33,7 @@ def discover_batch_sessions(paths, default_fs=1000.0, time_unit='auto'):
     folders = normalize_folder_paths(paths)
     sessions, names, loaded, issues = [], [], {}, []
     for folder in folders:
+        issues.extend(cleanup_legacy_temporaries(folder))
         try:
             files = sorted(Path(folder).iterdir())
         except OSError as exc:
@@ -39,7 +41,8 @@ def discover_batch_sessions(paths, default_fs=1000.0, time_unit='auto'):
             continue
         count = 0
         for source in files:
-            if not source.is_file() or source.suffix.lower() not in {'.csv', '.xlsx', '.npz'}:
+            if (not source.is_file() or is_excel_lock_file(source) or
+                    source.suffix.lower() not in {'.csv', '.xlsx', '.npz'}):
                 continue
             try:
                 data = load_session_path(str(source), default_fs=default_fs, time_unit=time_unit)
@@ -57,6 +60,8 @@ def discover_batch_sessions(paths, default_fs=1000.0, time_unit='auto'):
                 sessions.append(str(source))
                 names.append(name)
                 loaded[name] = data
+                for warning in data.get('load_warnings', []):
+                    issues.append(f'Input warning: {source}: {warning}')
                 count += 1
             except Exception as exc:
                 issues.append(f'Skipped: {source}: {exc}')

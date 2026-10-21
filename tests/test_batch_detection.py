@@ -128,7 +128,7 @@ class BatchDetectionTests(unittest.TestCase):
         self.win.refresh_sessions()
         self.assertEqual(self.win.run_detection_all(), (1, 1))
         expected = self.win.data['results'][0]
-        original = self.folders[0]/'spike_detection'/'session_analyzed.npz'
+        original = Path(self.win.data['results_file'])
         original_bytes = original.read_bytes()
         self.win.load_batch_folders(map(str, self.folders))
         self.assertEqual(self.win.run_detection_all(), (2, 2))
@@ -140,7 +140,7 @@ class BatchDetectionTests(unittest.TestCase):
         settings = []
         for name, data in self.win.loaded_sessions.items():
             self.assertTrue(Path(data['results_file']).is_file())
-            self.assertTrue(Path(data['results_file']).is_relative_to(Path(data['source_folder'])/'spike_detection'))
+            self.assertTrue(Path(data['results_file']).is_relative_to(self.win._temporary_store.directory))
             settings.append(json.loads(Path(data['settings_file']).read_text())['analysis_settings'])
         self.assertEqual(settings[0], settings[1])
         self.assertNotIn('two_step', settings[0])
@@ -374,7 +374,8 @@ class BatchDetectionTests(unittest.TestCase):
         self.assertEqual(self.win.detection_progress.value(), 2)
         self.assertTrue(self.win.centralWidget().isEnabled())
 
-    def test_colliding_stems_and_override(self):
+    def test_colliding_stems_and_confirmed_save(self):
+        self.win.chk_detection_save.setChecked(True)
         np.savez(self.folders[0]/'session.npz', time_ms=self.time,
                  raw_data=np.ones((len(self.time), 1)), cell_names=['flat'], fs=1000.)
         self.win.load_batch_folders([str(self.folders[0])])
@@ -383,8 +384,9 @@ class BatchDetectionTests(unittest.TestCase):
         self.assertEqual(len(set(files)), 2)
         self.assertTrue(any('session.csv_analyzed.npz' in x for x in files))
         self.assertTrue(any('session.npz_analyzed.npz' in x for x in files))
-        self.win.params['DETECTION_OVERRIDE'] = True
-        self.assertEqual(self.win.run_detection_all(), (2, 2))
+        with patch.object(self.win, '_confirm_result_replacement', return_value=True) as confirm:
+            self.assertEqual(self.win.run_detection_all(), (2, 2))
+        confirm.assert_called_once()
         self.assertEqual(files, [data['results_file'] for data in self.win.loaded_sessions.values()])
 
     def test_import_relative_path_list(self):

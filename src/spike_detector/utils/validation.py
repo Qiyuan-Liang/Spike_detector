@@ -58,6 +58,17 @@ def mask_windows(params):
 
 def effective_settings(params, baseline, frames, fs, n):
     out = {'fs_hz': float(fs), 'samples': int(n), 'filters': {}}
+    out['combo_detection'] = bool(params.get('COMBO_DETECTION', False))
+    out['template_whitening'] = bool(params.get('TEMPLATE_WHITENING', False)) and (
+        out['combo_detection'] or params.get('DETECTION_METHOD') == 'Template Matching')
+    if out['combo_detection']:
+        windows = {}
+        for kind, default, upper in (('CS', 30.0, 200), ('SS', 8.0, 100)):
+            window = float(params.get(f'TEMPLATE_{kind}_WINDOW_MS', default))
+            if not np.isfinite(window) or not 1 <= window <= upper:
+                raise ValueError(f'Combo {kind} template window must be between 1 and {upper} ms.')
+            windows[kind] = window
+        out['combo_seed_windows_ms'] = windows
     if params.get('TEMPLATE_MATCH_METHOD', 'LLR Probability Vector') not in ('LLR Probability Vector', 'Normalized Similarity', 'Burst-aware LLR'):
         raise ValueError('Unknown template matching method.')
     for key in ('TEMPLATE_CS_SIMILARITY', 'TEMPLATE_SS_SIMILARITY'):
@@ -91,7 +102,7 @@ def effective_settings(params, baseline, frames, fs, n):
     if not np.isfinite(val) or val < 0:
         raise ValueError('TEMPLATE_SS_LOWPASS_HZ must be nonnegative.')
     out['template_ss_lowpass_hz_used'] = (min(val, 0.45 * fs)
-        if val > 0 and params.get('DETECTION_METHOD') == 'Template Matching' else 0.0)
+        if val > 0 and (params.get('DETECTION_METHOD') == 'Template Matching' or params.get('COMBO_DETECTION')) else 0.0)
     for kind in ('CS', 'SS'):
         low, high = validate_band(params.get(f'{kind}_LOW_CUT_HZ', 0),
                                   params.get(f'{kind}_HIGH_CUT_HZ', 150 if kind == 'CS' else 0),
@@ -100,8 +111,9 @@ def effective_settings(params, baseline, frames, fs, n):
                                 'order': int(params.get(f'{kind}_FILTER_ORDER', 4))}
         for key in (f'{kind}_MIN_DIST_MS', f'{kind}_THRESHOLD_SIGMA', f'TEMPLATE_{kind}_SIGMA'):
             val = float(params.get(key, 1))
-            if not np.isfinite(val) or val < 0 or ('SIGMA' in key and val == 0):
-                raise ValueError(f'{key} must be finite and {"positive" if "SIGMA" in key else "nonnegative"}.')
+            if not np.isfinite(val) or val < 0 or (key.startswith('TEMPLATE_') and val == 0):
+                raise ValueError(f'{key} must be finite and {"positive" if key.startswith("TEMPLATE_") else "nonnegative"}.')
+        out[f'{kind.lower()}_threshold_enabled'] = float(params.get(f'{kind}_THRESHOLD_SIGMA', 1)) > 0
         out[f'{kind.lower()}_min_distance_samples'] = max(1, int(np.ceil(params.get(f'{kind}_MIN_DIST_MS', 1)*fs/1000)))
     pre, post = mask_windows(params)
     for key, val in [('SS pre-CS mask', pre), ('SS post-CS mask', post),

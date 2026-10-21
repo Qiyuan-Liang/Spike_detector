@@ -1,16 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Windows one-folder GUI build. Invoke from the extracted bundle root."""
+"""Windows one-folder / macOS application-bundle GUI build. Invoke from the extracted bundle root."""
 
 from pathlib import Path
+import sys
+import tomllib
 from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = Path(SPEC).resolve().parents[2]
+ASSETS = ROOT / 'src' / 'spike_detector' / 'assets'
+VERSION = tomllib.loads((ROOT / 'pyproject.toml').read_text(encoding='utf-8'))['project']['version']
 
 analysis = Analysis(
     [str(ROOT / 'spike_detector_launcher.py')],
     pathex=[str(ROOT / 'src')],
     binaries=[],
-    datas=collect_data_files('matplotlib'),
+    datas=collect_data_files('matplotlib') + [(str(ASSETS), 'spike_detector/assets')],
     hiddenimports=[
         'PyQt6.QtCore',
         'PyQt6.QtGui',
@@ -41,6 +45,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(ASSETS / 'spike_detector.ico') if sys.platform == 'win32' else None,
 )
 collection = COLLECT(
     exe,
@@ -50,3 +55,17 @@ collection = COLLECT(
     upx=False,
     name='spike_detector',
 )
+
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        collection,
+        name='Spike Detector.app',
+        icon=str(ASSETS / 'spike_detector.icns'),
+        bundle_identifier='org.spikedetector.gui',
+        version=VERSION,
+        info_plist={
+            'CFBundleDisplayName': 'Spike Detector',
+            'CFBundleVersion': VERSION,
+            'NSHighResolutionCapable': True,
+        },
+    )

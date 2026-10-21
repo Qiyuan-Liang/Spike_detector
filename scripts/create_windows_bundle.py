@@ -24,6 +24,12 @@ REQUIRED = (
     'packaging/pyinstaller/spike_detector.spec',
     'scripts/create_windows_bundle.py',
     'scripts/verify_bundle.py',
+    'scripts/create_app_icons.py',
+    'src/spike_detector/assets/spike_detector.png',
+    'src/spike_detector/assets/spike_detector_macos.png',
+    'src/spike_detector/assets/spike_detector_macos.svg',
+    'src/spike_detector/assets/spike_detector.ico',
+    'src/spike_detector/assets/spike_detector.icns',
 )
 
 

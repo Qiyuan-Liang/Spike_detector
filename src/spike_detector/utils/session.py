@@ -6,12 +6,18 @@ import pandas as pd
 from .validation import validate_time, validate_session
 
 
+def is_excel_lock_file(path):
+    """Excel owner files share the workbook extension but contain no trace data."""
+    name = os.path.basename(os.fspath(path))
+    return name.startswith('~$') and os.path.splitext(name)[1].lower() == '.xlsx'
+
+
 def _list_table_files_in_dir(folder_path):
     files = []
     try:
         for name in os.listdir(folder_path):
             fp = os.path.join(folder_path, name)
-            if not os.path.isfile(fp):
+            if not os.path.isfile(fp) or is_excel_lock_file(fp):
                 continue
             ext = os.path.splitext(name)[1].lower()
             if ext in {'.xlsx', '.csv'}:
@@ -54,6 +60,8 @@ def normalize_time_and_fs(time_vec_raw, default_fs=1000.0, time_unit='auto', col
 
 
 def load_table_session_file(file_path, default_fs=1000.0, time_unit='auto'):
+    if is_excel_lock_file(file_path):
+        raise ValueError('Temporary Excel lock file is not a recording; select the workbook without the ~$ prefix.')
     stem = os.path.splitext(os.path.basename(file_path))[0].lower()
     if stem.endswith(('_time_offsets', '_coordinates')):
         raise ValueError('Auxiliary time-offset/coordinate table is not a spike trace recording.')
@@ -73,6 +81,36 @@ def load_table_session_file(file_path, default_fs=1000.0, time_unit='auto'):
             f'Invalid table format in {os.path.basename(file_path)}: '
             'expected at least 2 columns (time + >=1 cell trace).'
         )
+
+    # A table can contain trace values below the last timestamp (for example,
+    # one ROI column pasted longer than the shared time axis). The rectangular
+    # detector can only analyze rows with timestamps. Keep the valid timed
+    # prefix and report any excluded untimed values; missing rows *inside* the
+    # timed region still fail the strict checks below.
+    numeric_time = pd.to_numeric(df.iloc[:, 0], errors='coerce').to_numpy(dtype=float)
+    timed_rows = np.flatnonzero(np.isfinite(numeric_time))
+    if timed_rows.size == 0:
+        raise ValueError(f'Invalid time column in {os.path.basename(file_path)}: no numeric timestamps found.')
+    last_timed_row = int(timed_rows[-1])
+    tail = df.iloc[last_timed_row + 1:]
+    if not tail.empty and tail.iloc[:, 0].notna().any():
+        raise ValueError('Non-numeric time labels occur after the last timestamp; inspect the table before detection.')
+    untimed_counts = tail.iloc[:, 1:].notna().sum() if not tail.empty else pd.Series(dtype=int)
+    ignored_untimed_tail_rows = int(len(tail))
+    load_warnings = []
+    if ignored_untimed_tail_rows:
+        affected = [(str(name), int(count)) for name, count in untimed_counts.items() if count]
+        if affected:
+            detail = ', '.join(f'{name}: {count:,}' for name, count in affected[:3])
+            if len(affected) > 3:
+                detail += f', and {len(affected) - 3} more cell(s)'
+            load_warnings.append(
+                f'Excluded {ignored_untimed_tail_rows:,} rows after the last timestamp; '
+                f'untimed trace values were present ({detail}). Add timestamps to analyze that tail.'
+            )
+        else:
+            load_warnings.append(f'Ignored {ignored_untimed_tail_rows:,} completely blank trailing rows.')
+        df = df.iloc[:last_timed_row + 1]
 
     time_vec_raw = pd.to_numeric(df.iloc[:, 0], errors='coerce').to_numpy(dtype=float)
     raw_matrix_full = df.iloc[:, 1:].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
@@ -103,6 +141,8 @@ def load_table_session_file(file_path, default_fs=1000.0, time_unit='auto'):
         'cell_names': df.columns[1:].tolist(),
         'fs': fs,
         'session_path': file_path,
+        'ignored_untimed_tail_rows': ignored_untimed_tail_rows,
+        'load_warnings': load_warnings,
     }
     validate_session(data)
     return data

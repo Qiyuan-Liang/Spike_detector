@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spike-detector-gui"
-version = "3.6.31"
+version = "3.6.41"
 description = "GUI spike detector for CS/SS activity in Purkinje neurons"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -59,3 +59,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+spike_detector = ["assets/*.png", "assets/*.ico", "assets/*.icns", "assets/*.svg"]
