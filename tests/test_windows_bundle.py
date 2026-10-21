@@ -29,6 +29,7 @@ class WindowsBundleTests(unittest.TestCase):
             self.assertEqual(names, set(manifest['sha256']) | {'BUNDLE_MANIFEST.json'})
             self.assertEqual(manifest['app_version'], tomllib.loads((ROOT/'pyproject.toml').read_text())['project']['version'])
             self.assertIn('src/spike_detector/utils/validation.py', names)
+            self.assertIn('src/spike_detector/utils/qc.py', names)
             self.assertIn('src/spike_detector/utils/widths.py', names)
             self.assertIn('src/spike_detector/utils/batch.py', names)
             self.assertIn('src/spike_detector/assets/spike_detector_macos.png', names)

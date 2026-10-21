@@ -69,9 +69,10 @@ from .utils.stats import (autocorrelogram_counts, autocorrelogram_components,
 from .utils.validation import validate_session, effective_settings, mask_windows
 from .utils.widths import measure_width, measure_widths
 from .utils.combo import process_cell_combo
+from .utils.qc import QC_DEFAULTS, LEGACY_QC_KEYS, migrate_qc_settings, run_with_qc
 from .utils.results import TemporaryDetectionStore, cleanup_legacy_temporaries, output_paths, publish_detection
 
-APP_VERSION = '3.6.41'
+APP_VERSION = '3.6.42'
 
 
 # Keep input help in one place so the same setting reads consistently in the
@@ -81,13 +82,11 @@ SETTING_TOOLTIPS = {
     'combo_path': 'Limit statistics to one loaded folder, or include all folders.',
     'combo_session': 'Choose a recording session to view or summarize.',
     'combo_cell': 'Choose a cell; All pools the selected cells where available.',
-    'btn_polarity_positive': 'Detect upward-going spikes. Uses the same saved polarity parameter for ordinary, Combo and batch detection.',
-    'btn_polarity_negative': 'Detect downward-going spikes by inverting the corrected trace for detection. Raw display retains its recorded polarity.',
     'combo_baseline_method': 'Choose how slow baseline drift is estimated before detection.',
-    'spin_baseline_window': 'Time window used to estimate the drifting baseline.',
+    'spin_baseline_window': 'Requested window for median/percentile drift estimation. Its effective sample count is constrained by recording length and saved in result metadata.',
     'spin_baseline_percentile': 'Percentile used only for the Percentile baseline method.',
-    'combo_frame_processing': 'Choose rolling frame averaging or frame-group downsampling.',
-    'spin_avg_frames': 'Number of frames grouped before detection; 0 disables frame processing.',
+    'combo_frame_processing': 'Choose rolling averaging, or block averaging interpolated back to the original time grid. Frame grouping reduces temporal resolution without changing stored sample times.',
+    'spin_avg_frames': 'Frames used for rolling or block averaging before detection. 0 disables processing; 1 leaves the trace unchanged. Larger groups smooth noise and fast spikes.',
     'spin_window': 'Time span displayed in the plot; this does not change detection.',
     'spin_zoom': 'Vertical plot range; 0 chooses the range automatically.',
     'slider_time': 'Move the visible time window through the recording.',
@@ -104,20 +103,18 @@ SETTING_TOOLTIPS = {
     'chk_show_cs': 'Show the filtered CS trace in the main plot.',
     'chk_show_ss': 'Show the filtered SS trace in the main plot.',
     'chk_denoise': 'Apply adaptive wavelet denoising before SS detection.',
-    'chk_local_baseline': 'Subtract an additional local baseline from detection traces.',
-    'spin_local_ss_ms': 'Window for the additional local SS baseline.',
-    'spin_local_cs_ms': 'Window for the additional local CS baseline.',
+    'chk_local_baseline': 'Use a centered, rolling Gaussian-scaled MAD noise estimate for Threshold cutoffs and Combo seeds. Does not subtract another baseline or change template scoring, amplitude-SNR windows or whitening.',
+    'spin_local_ss_ms': 'Centered window for local SS threshold-noise estimation. Used only with Local noise, including Combo seeds; separate from amplitude-SNR and whitening windows.',
+    'spin_local_cs_ms': 'Centered window for local CS threshold-noise estimation. Used only with Local noise, including Combo seeds; separate from amplitude-SNR and whitening windows.',
     'chk_template_parallel': 'Match separate groups of template shapes and combine candidates.',
     'chk_template_whitening': 'Estimate background noise spectrum and whiten both trace and matching kernels. Applies to template, Combo and batch detection; cutoffs may need retuning.',
     'chk_combo': 'Learn temporary templates per cell from Threshold-tab seeds, then use Template-tab matching settings. Use conservative seed thresholds.',
     'spin_template_groups': 'Number of template shape groups; View can enable each group.',
     'combo_template_method': 'Choose amplitude-fit LLR, experimental positive-core SS, or similarity scoring.',
-    'spin_template_cs_sigma': 'Minimum positive CS matched response divided by unmasked trace MAD.',
-    'spin_template_cs_peak': 'Minimum filtered CS trace height at a candidate, in MAD units; 0 disables.',
-    'spin_template_ss_sigma': 'Minimum positive SS matched response divided by unmasked trace MAD.',
+    'spin_template_cs_sigma': 'CS positive matched response / Gaussian-scaled background MAD of the filtered or whitened trace. The LLR gain cutoff is this value squared / 2. Separate from amplitude SNR; not a calibrated probability.',
+    'spin_template_ss_sigma': 'SS short-core matched response / Gaussian-scaled background MAD of the filtered or whitened trace. The LLR gain cutoff is this value squared / 2. Separate from amplitude SNR; not a calibrated probability.',
     'spin_template_cs_sim': 'Minimum CS waveform correlation for Normalized Similarity.',
     'spin_template_ss_sim': 'Minimum SS core correlation for Normalized Similarity.',
-    'spin_template_min_response': 'Minimum SS matched response in MAD units; mainly useful in similarity mode.',
     'spin_template_lowpass': 'Additional SS low-pass cutoff for template detection; 0 disables.',
     'chk_detection_save': 'Save permanent results beside recordings. Unchecked: temporary viewing exports, removed on close. Existing saved results require confirmation before replacement.',
     'paths': 'Enter one recording-folder path per line for batch detection.',
@@ -132,19 +129,16 @@ SETTING_TOOLTIPS = {
     'spin_ss_acg_window': 'Maximum positive and negative SS lag shown in the autocorrelogram.',
     'spin_ss_acg_bin': 'Width of each SS autocorrelogram lag bin.',
     'chk_denoise_cs': 'Use the denoised trace for CS detection as well as SS detection.',
-    'spin_cs_mind': 'Minimum allowed time between retained CS events.',
-    'spin_cs_min_fwhm': 'Reject CS only when measured FWHM is below this width.',
-    'spin_ss_mind': 'Minimum allowed time between retained SS events.',
-    'spin_ss_mask_pre': 'Exclude SS candidates this long before each detected CS.',
-    'spin_ss_mask_post': 'Exclude SS candidates this long after each detected CS.',
-    'chk_ss_max_fwhm': 'Reject SS with a measured FWHM above the chosen maximum.',
-    'spin_ss_max_fwhm': 'Maximum measured SS FWHM when the broad-SS filter is enabled.',
-    'spin_initial_blank': 'Ignore this much data at the start of each recording.',
+    'spin_cs_mind': 'Minimum CS candidate spacing before QC. 0 disables extra spacing beyond the native sample grid; applies to every detector.',
+    'spin_ss_mind': 'Minimum SS candidate spacing before QC. Applied once across template groups; 0 disables extra spacing beyond the native sample grid.',
+    'spin_ss_mask_pre': 'Exclude SS this long before accepted CS; 0 removes this side. Template/FIR support can extend the actual masked region.',
+    'spin_ss_mask_post': 'Exclude SS this long after accepted CS; 0 removes this side. Template/FIR support can extend the actual masked region.',
+    'spin_initial_blank': 'Ignore this duration at recording start; 0 disables this exclusion. Template support still masks incomplete boundary windows.',
     'spin_tpl_cs_window': 'Duration of CS waveforms saved as templates.',
     'spin_tpl_ss_window': 'Duration of SS waveforms saved as templates.',
     'spin_template_components': 'PCA components used to group templates, not detection kernels.',
     'spin_line_scale': 'Scale the line thickness used in plots and exported figures.',
-    'combo_raw_scale_unit': 'Show the raw-trace scale bar in MAD-based noise sigma or dF/F percent.',
+    'combo_raw_scale_unit': 'Raw-trace scale bar in Gaussian-scaled MAD noise units (SD fallback) or ΔF/F percent. This scale is separate from local event SNR.',
     'spin_preview_window': 'Time span shown in the denoising preview.',
     'spin_f_min': 'Lowest frequency included in the wavelet transform.',
     'spin_f_max': 'Highest frequency included in the wavelet transform.',
@@ -152,15 +146,15 @@ SETTING_TOOLTIPS = {
     'spin_min_clusters': 'Smallest frequency-cluster count considered by denoising.',
     'spin_max_clusters': 'Largest frequency-cluster count considered by denoising.',
     'spin_pca': 'Maximum PCA components used to cluster frequency profiles.',
-    'spin_thr_sigma': 'Wavelet coefficient threshold in robust noise units.',
+    'spin_thr_sigma': 'Cluster-envelope cutoff: local mean + this multiplier × local SD. A larger value attenuates more frames; this is not event SNR or a MAD cutoff.',
     'spin_att_min': 'Minimum retained coefficient fraction after attenuation.',
     'chk_soft': 'Gradually attenuate coefficients below threshold instead of hard suppression.',
-    'spin_cycles': 'Cycles used to set the local wavelet threshold window.',
+    'spin_cycles': 'Local envelope-threshold window = cycles / highest frequency in each cluster, with at least five samples.',
     'spin_max_tp': 'Maximum time samples used to fit frequency clusters.',
     'chk_event_refine': 'Apply optional event-level PC1-based attenuation after denoising.',
     'spin_evt_win': 'Time window around candidate events for PC1 refinement.',
-    'spin_evt_sigma': 'Event amplitude cutoff in robust noise units for refinement.',
-    'spin_evt_z': 'PC1 score cutoff used to identify events for attenuation.',
+    'spin_evt_sigma': 'Absolute reconstructed cluster-trace amplitude cutoff in Gaussian-scaled MAD units for proposing refinement events.',
+    'spin_evt_z': 'Attenuate event windows whose PC1 score, centered on its median and scaled by MAD, falls below this cutoff.',
     'spin_evt_att': 'Fraction retained for events selected by PC1 refinement.',
     'chk_show_advanced': 'Show the advanced denoising controls.',
     'combo': 'Choose a color preset to preview and customize.',
@@ -210,7 +204,7 @@ def _detect_cell(raw, fs, params, baseline_params, frames, frame_mode, templates
         cs_low_cut=params.get('CS_LOW_CUT_HZ', 0.0),
         cs_high_cut=params.get('CS_HIGH_CUT_HZ', 150.0),
         cs_min_dist_ms=params.get('CS_MIN_DIST_MS', 25.0),
-        cs_min_fwhm_ms=params.get('CS_MIN_FWHM_MS', 4.0),
+        cs_min_fwhm_ms=0.0,
         ss_low_cut=params.get('SS_LOW_CUT_HZ', 0.0),
         ss_high_cut=params.get('SS_HIGH_CUT_HZ', 0.0),
         ss_min_dist_ms=params.get('SS_MIN_DIST_MS', 4.0),
@@ -227,12 +221,12 @@ def _detect_cell(raw, fs, params, baseline_params, frames, frame_mode, templates
     if params.get('COMBO_DETECTION') or params.get('DETECTION_METHOD') == 'Template Matching':
         template_options = dict(
             cs_thresh_sigma=params.get('TEMPLATE_CS_SIGMA', 6.0),
-            cs_min_filtered_peak_sigma=params.get('TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA', 3.0),
+            cs_min_filtered_peak_sigma=0.0,
             ss_thresh_sigma=params.get('TEMPLATE_SS_SIGMA', 3.0),
             template_match_method=params.get('TEMPLATE_MATCH_METHOD', 'LLR Probability Vector'),
             cs_similarity_threshold=params.get('TEMPLATE_CS_SIMILARITY', .90),
             ss_similarity_threshold=params.get('TEMPLATE_SS_SIMILARITY', .80),
-            similarity_min_response_sigma=params.get('TEMPLATE_MIN_RESPONSE_SIGMA', 2.2),
+            similarity_min_response_sigma=0.0,
             template_ss_lowpass_hz=params.get('TEMPLATE_SS_LOWPASS_HZ', 700.0),
             template_whitening=bool(params.get('TEMPLATE_WHITENING', False)),
             fixed_whitening=fixed_whitening,
@@ -252,21 +246,21 @@ def _detect_cell(raw, fs, params, baseline_params, frames, frame_mode, templates
                 template_options=template_options, fallback_templates=templates,
                 cs_window_ms=params.get('TEMPLATE_CS_WINDOW_MS', 30.0),
                 ss_window_ms=params.get('TEMPLATE_SS_WINDOW_MS', 8.0),
-                ss_max_width=params.get('SS_MAX_FWHM_MS', 4.5)
-                    if params.get('SS_MAX_FWHM_FILTER_ENABLED', True) else None)
+                ss_max_width=params.get('SS_MAX_FWHM_MS', 4.5) or None,
+                qc_params=params, qc_source=corrected * sign)
         else:
-            result = process_cell_template_matching(raw_proc, fs, **common, **template_options,
+            result = run_with_qc(lambda **qc: process_cell_template_matching(raw_proc, fs, **common, **template_options, **qc,
                 template_cs_bank=templates.get('cs_templates', []),
                 template_ss_bank=templates.get('ss_templates', []),
                 template_cs_fs_bank=templates.get('fs_cs', []),
-                template_ss_fs_bank=templates.get('fs_ss', []))
+                template_ss_fs_bank=templates.get('fs_ss', [])), corrected * sign, fs, params)
     else:
-        result = process_cell_simple(raw_proc, fs,
+        result = run_with_qc(lambda **qc: process_cell_simple(raw_proc, fs,
             cs_thresh_sigma=params.get('CS_THRESHOLD_SIGMA', 6.0),
             ss_thresh_sigma=params.get('SS_THRESHOLD_SIGMA', 2.5),
             local_baseline=bool(params.get('LOCAL_BASELINE', False)),
             local_baseline_cs_ms=float(params.get('LOCAL_BASELINE_CS_MS', 200.0)),
-            local_baseline_ss_ms=float(params.get('LOCAL_BASELINE_SS_MS', 50.0)), **common)
+            local_baseline_ss_ms=float(params.get('LOCAL_BASELINE_SS_MS', 50.0)), **common, **qc), corrected * sign, fs, params)
     result['denoise_enabled'] = bool(params.get('DENOISE_ENABLED', False))
     result['negative_going'] = bool(params.get('NEGATIVE_GOING', True))
     result['denoise_apply_to_cs'] = bool(params.get('DENOISE_APPLY_TO_CS', False))
@@ -296,16 +290,9 @@ def _polarity_reversed_control(raw, fs, context, original_result):
         dict(context['baseline_params']), int(context['frames']), context['frame_mode'],
         templates, context['denoise_cfg'], fixed_exclusion_masks=masks,
         fixed_whitening=original_result.get('_template_whitening'))
-    rows = measure_widths(np.asarray(result['ss_trace'], dtype=float), result['ss_peaks'], fs,
-        _stats_window_ms('SS'), neighbors=result['cs_peaks'],
-        align_ms=result.get('width_alignment_ms', 0))
-    maximum = float(params.get('SS_MAX_FWHM_MS', 4.5))
-    use_maximum = bool(params.get('SS_MAX_FWHM_FILTER_ENABLED', True))
-    ss_kept = sum(not np.isfinite(row['fwhm_ms']) or
-                  (not use_maximum or row['fwhm_ms'] <= maximum) for row in rows)
     return dict(cs_score_peaks=result['cs_candidate_diagnostics']['score_peaks'],
                 ss_score_peaks=result['ss_candidate_diagnostics']['score_peaks'],
-                cs_kept=len(result['cs_peaks']), ss_kept=ss_kept,
+                cs_kept=len(result['cs_peaks']), ss_kept=len(result['ss_peaks']),
                 cs_masked=result['cs_candidate_diagnostics']['masked'],
                 ss_masked=result['ss_candidate_diagnostics']['masked'])
 
@@ -1452,12 +1439,15 @@ class MainWindow(QtWidgets.QMainWindow):
             'CS_THRESHOLD_SIGMA': 6.0,
             'CS_MIN_DIST_MS': 25.0,
             'CS_MIN_FWHM_MS': 4.0,
+            'CS_MAX_FWHM_MS': 0.0,
+            'CS_MIN_AMPLITUDE_SNR': 0.0,
+            'SS_MIN_AMPLITUDE_SNR': 0.0,
+            'SS_MIN_FWHM_MS': 0.0,
             'SS_LOW_CUT_HZ': 0.0,
             'SS_HIGH_CUT_HZ': 0.0,
             'SS_THRESHOLD_SIGMA': 2.5,
             'SS_MIN_DIST_MS': 4.0,
             'SS_BLANK_MS': 18.0,
-            'SS_MAX_FWHM_FILTER_ENABLED': True,
             'SS_MAX_FWHM_MS': 4.5,
             'INITIAL_BLANK_MS': 150.0,
             'CS_FILTER_ORDER': 4,
@@ -1473,11 +1463,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'TEMPLATE_CS_SELECTED_GROUPS': None,
             'TEMPLATE_SS_SELECTED_GROUPS': None,
             'TEMPLATE_CS_SIGMA': 6.0,
-            'TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA': 3.0,
             'TEMPLATE_SS_SIGMA': 3.0,
             'TEMPLATE_CS_SIMILARITY': 0.90,
             'TEMPLATE_SS_SIMILARITY': 0.80,
-            'TEMPLATE_MIN_RESPONSE_SIGMA': 2.2,
             'TEMPLATE_SS_LOWPASS_HZ': 700.0,
             'LOCAL_BASELINE': False,
             'LOCAL_BASELINE_SS_MS': 50.0,
@@ -1504,6 +1492,12 @@ class MainWindow(QtWidgets.QMainWindow):
             'RAW_SCALE_BAR_UNIT': 'Sigma',
             'STATS_CS_BG_ALPHA': 0.3,
             'STATS_SS_BG_ALPHA': 0.003,
+            'DETECTION_VIEW_WINDOW_MS': 500.0,
+            'DETECTION_VIEW_Y_RANGE': 0.0,
+            'DETECTION_VIEW_CENTER': 200,
+            'SLIDER_VIEW_Y_RANGE': 0.0,
+            'SLIDER_VIEW_CENTER': 200,
+            'DENOISE_SHOW_ADVANCED': False,
             }
         _set_user_linewidth_scale(self.params.get('LINE_WIDTH_SCALE', 0.7))
 
@@ -1546,7 +1540,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Folder/session controls (compact folded list using QComboBox)
         vbox_left = QtWidgets.QVBoxLayout()
-        vbox_left.setSpacing(3)
+        vbox_left.setSpacing(5)
         vbox_left.setAlignment(ALIGN_TOP)
         btn_folder = QtWidgets.QPushButton('Select Folder')
         btn_folder.clicked.connect(self.select_folder)
@@ -1573,24 +1567,26 @@ class MainWindow(QtWidgets.QMainWindow):
         vbox_left.addLayout(h_cell)
         h_polarity = QtWidgets.QHBoxLayout()
         h_polarity.addWidget(QtWidgets.QLabel('Spike polarity:'))
-        self.btn_polarity_positive = QtWidgets.QPushButton('Positive-going')
-        self.btn_polarity_negative = QtWidgets.QPushButton('Negative-going')
-        self.polarity_buttons = QtWidgets.QButtonGroup(self)
-        self.polarity_buttons.setExclusive(True)
-        for button, negative in ((self.btn_polarity_positive, False), (self.btn_polarity_negative, True)):
-            button.setCheckable(True)
-            button.setStyleSheet('QPushButton:checked { background-color: #007AFF; color: white; border-radius: 4px; }')
-            button.clicked.connect(lambda checked, value=negative: self.on_polarity_changed(value))
-            self.polarity_buttons.addButton(button)
-            h_polarity.addWidget(button)
+        self.tabs_polarity = QtWidgets.QTabWidget()
+        self.tabs_polarity.addTab(QtWidgets.QWidget(), 'Positive-going')
+        self.tabs_polarity.addTab(QtWidgets.QWidget(), 'Negative-going')
+        self.tabs_polarity.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
+                                        QtWidgets.QSizePolicy.Policy.Fixed)
+        self.tabs_polarity.tabBar().setUsesScrollButtons(False)
+        self.tabs_polarity.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
+        self.tabs_polarity.setMinimumWidth(self.tabs_polarity.tabBar().sizeHint().width() + 8)
+        self.tabs_polarity.setFixedHeight(self.tabs_polarity.tabBar().sizeHint().height() + 2)
+        self.tabs_polarity.setToolTip('Spike direction, shared by threshold, template, Combo and batch detection. Raw traces retain recorded polarity.')
         self._sync_polarity_buttons()
+        self.tabs_polarity.currentChanged.connect(lambda index: self.on_polarity_changed(index == 1))
+        h_polarity.addWidget(self.tabs_polarity, 1)
         vbox_left.addLayout(h_polarity)
         # keep compact, add to upper layout later
         # upper_layout.addLayout(vbox_left)
 
         # Baseline correction controls
         vbox_mid = QtWidgets.QVBoxLayout()
-        vbox_mid.setSpacing(3)
+        vbox_mid.setSpacing(5)
         vbox_mid.setAlignment(ALIGN_TOP)
 
         self.combo_baseline_method = QtWidgets.QComboBox()
@@ -1633,7 +1629,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_avg_frames = QtWidgets.QSpinBox(); self.spin_avg_frames.setRange(0, 500); self.spin_avg_frames.setValue(0)
         self.spin_avg_frames.valueChanged.connect(self.update_plot)
         h_avg = QtWidgets.QHBoxLayout()
-        h_avg.addWidget(QtWidgets.QLabel('Frames (0 = off):'))
+        h_avg.addWidget(QtWidgets.QLabel('Frames:'))
         h_avg.addWidget(self.spin_avg_frames)
         vbox_mid.addLayout(h_avg)
         h_denoise = QtWidgets.QHBoxLayout()
@@ -1680,11 +1676,11 @@ class MainWindow(QtWidgets.QMainWindow):
         vbox_right.addWidget(QtWidgets.QLabel('CS / SS Detection Settings'))
         self.spin_cs_low = QtWidgets.QDoubleSpinBox(); self.spin_cs_low.setRange(0.0, 5000.0); self.spin_cs_low.setValue(self.params.get('CS_LOW_CUT_HZ',0.0))
         self.spin_cs_low.valueChanged.connect(lambda v: (self.params.update({'CS_LOW_CUT_HZ': float(v)}), self.update_plot()))
-        vbox_right.addWidget(QtWidgets.QLabel('CS low cut (Hz, 0=off):'))
+        vbox_right.addWidget(QtWidgets.QLabel('CS low cut (Hz):'))
         vbox_right.addWidget(self.spin_cs_low)
         self.spin_cs_high = QtWidgets.QDoubleSpinBox(); self.spin_cs_high.setRange(0.0, 5000.0); self.spin_cs_high.setValue(self.params.get('CS_HIGH_CUT_HZ',150.0))
         self.spin_cs_high.valueChanged.connect(lambda v: (self.params.update({'CS_HIGH_CUT_HZ': float(v)}), self.update_plot()))
-        vbox_right.addWidget(QtWidgets.QLabel('CS high cut (Hz, 0=off):'))
+        vbox_right.addWidget(QtWidgets.QLabel('CS high cut (Hz):'))
         vbox_right.addWidget(self.spin_cs_high)
         self.spin_cs_thresh = QtWidgets.QDoubleSpinBox(); self.spin_cs_thresh.setRange(0.0,50.0); self.spin_cs_thresh.setDecimals(3); self.spin_cs_thresh.setSingleStep(0.05); self.spin_cs_thresh.setValue(self.params.get('CS_THRESHOLD_SIGMA',6.0))
         self.spin_cs_thresh.valueChanged.connect(lambda v: (self.params.update({'CS_THRESHOLD_SIGMA': float(v)}), self.update_plot()))
@@ -1701,11 +1697,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.spin_ss_low = QtWidgets.QDoubleSpinBox(); self.spin_ss_low.setRange(0.0,5000.0); self.spin_ss_low.setValue(self.params.get('SS_LOW_CUT_HZ',0.0))
         self.spin_ss_low.valueChanged.connect(lambda v: (self.params.update({'SS_LOW_CUT_HZ': float(v)}), self.update_plot()))
-        vbox_right.addWidget(QtWidgets.QLabel('SS low cut (Hz, 0=off):'))
+        vbox_right.addWidget(QtWidgets.QLabel('SS low cut (Hz):'))
         vbox_right.addWidget(self.spin_ss_low)
         self.spin_ss_high = QtWidgets.QDoubleSpinBox(); self.spin_ss_high.setRange(0.0,5000.0); self.spin_ss_high.setValue(self.params.get('SS_HIGH_CUT_HZ',0.0))
         self.spin_ss_high.valueChanged.connect(lambda v: (self.params.update({'SS_HIGH_CUT_HZ': float(v)}), self.update_plot()))
-        vbox_right.addWidget(QtWidgets.QLabel('SS high cut (Hz, 0=off):'))
+        vbox_right.addWidget(QtWidgets.QLabel('SS high cut (Hz):'))
         vbox_right.addWidget(self.spin_ss_high)
         self.spin_ss_thresh = QtWidgets.QDoubleSpinBox(); self.spin_ss_thresh.setRange(0.0,50.0); self.spin_ss_thresh.setDecimals(3); self.spin_ss_thresh.setSingleStep(0.05); self.spin_ss_thresh.setValue(self.params.get('SS_THRESHOLD_SIGMA',2.5))
         self.spin_ss_thresh.valueChanged.connect(lambda v: (self.params.update({'SS_THRESHOLD_SIGMA': float(v)}), self.update_plot()))
@@ -1750,12 +1746,12 @@ class MainWindow(QtWidgets.QMainWindow):
         upper_h.setSpacing(4)
         upper_h.setContentsMargins(2, 2, 2, 2)
         col1 = QtWidgets.QVBoxLayout(); col2 = QtWidgets.QVBoxLayout(); col3 = QtWidgets.QVBoxLayout()
-        col1.setSpacing(3); col2.setSpacing(3); col3.setSpacing(3)
+        col1.setSpacing(5); col2.setSpacing(6); col3.setSpacing(5)
         for column in (col1, col2, col3):
             column.setAlignment(ALIGN_TOP)
         col1.setContentsMargins(2,1,2,1); col2.setContentsMargins(2,1,2,1); col3.setContentsMargins(2,1,2,1)
         col1.addLayout(vbox_left)
-        col1.addSpacing(2)
+        col1.addSpacing(6)
         col1.addLayout(vbox_mid)
         col1.addSpacing(3)
         raw_group = QtWidgets.QVBoxLayout()
@@ -1798,10 +1794,10 @@ class MainWindow(QtWidgets.QMainWindow):
             group = QtWidgets.QGroupBox(kind)
             grid = QtWidgets.QGridLayout(group)
             grid.setContentsMargins(8, 4, 8, 6)
-            grid.setHorizontalSpacing(6)
-            grid.setVerticalSpacing(3)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(5)
             prefix = kind.lower()
-            threshold_label = QtWidgets.QLabel('Threshold (σ, 0=off):')
+            threshold_label = QtWidgets.QLabel('Threshold (σ):')
             setattr(self, f'lbl_{prefix}_threshold', threshold_label)
             for label, widget, row, column in (
                 (QtWidgets.QLabel('High-pass (Hz):'), getattr(self, f'spin_{prefix}_low'), 0, 0),
@@ -1813,16 +1809,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 widget.setMinimumWidth(65)
                 grid.addWidget(widget, row, column + 1)
             for attr in (f'spin_{prefix}_low', f'spin_{prefix}_high'):
-                getattr(self, attr).setSpecialValueText('Off')
+                getattr(self, attr).setSpecialValueText('')
             grid.setColumnStretch(1, 1)
             grid.setColumnStretch(3, 1)
             self.threshold_groups[kind] = group
             lay_threshold.addWidget(group)
         h_local_bl = QtWidgets.QHBoxLayout()
-        self.chk_local_baseline = QtWidgets.QCheckBox('Local baseline')
+        self.chk_local_baseline = QtWidgets.QCheckBox('Local noise')
         self.chk_local_baseline.setChecked(bool(self.params.get('LOCAL_BASELINE', False)))
         self.chk_local_baseline.stateChanged.connect(lambda v: (self.params.update({'LOCAL_BASELINE': bool(v)}), self.update_plot()))
         h_local_bl.addWidget(self.chk_local_baseline)
+        h_local_bl.addSpacing(6)
         h_local_bl.addWidget(QtWidgets.QLabel('SS win (ms):'))
         self.spin_local_ss_ms = QtWidgets.QDoubleSpinBox()
         self.spin_local_ss_ms.setRange(5.0, 5000.0)
@@ -1846,7 +1843,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_template = QtWidgets.QWidget()
         lay_template = QtWidgets.QVBoxLayout()
         lay_template.setContentsMargins(8, 6, 8, 6)
-        lay_template.setSpacing(4)
+        lay_template.setSpacing(6)
         lay_template.setAlignment(ALIGN_TOP)
         btn_load_cs = QtWidgets.QPushButton('Load CS templates')
         btn_load_ss = QtWidgets.QPushButton('Load SS templates')
@@ -1864,10 +1861,11 @@ class MainWindow(QtWidgets.QMainWindow):
         h_tpl_load.addWidget(btn_view_tpl)
         lay_template.addLayout(h_tpl_load)
         h_tpl_parallel = QtWidgets.QHBoxLayout()
-        self.chk_template_parallel = QtWidgets.QCheckBox('parallel')
+        self.chk_template_parallel = QtWidgets.QCheckBox('Parallel')
         self.chk_template_parallel.setChecked(bool(self.params.get('TEMPLATE_PARALLEL', False)))
         self.chk_template_parallel.stateChanged.connect(self.on_template_controls_changed)
         h_tpl_parallel.addWidget(self.chk_template_parallel)
+        h_tpl_parallel.addSpacing(6)
         h_tpl_parallel.addWidget(QtWidgets.QLabel('Shape groups:'))
         self.spin_template_groups = QtWidgets.QSpinBox()
         self.spin_template_groups.setRange(1, 8)
@@ -1887,7 +1885,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay_template.addWidget(self.lbl_template_status)
 
         h_tmode = QtWidgets.QHBoxLayout()
-        h_tmode.addWidget(QtWidgets.QLabel('Template method:'))
+        h_tmode.addWidget(QtWidgets.QLabel('Matching score:'))
         self.combo_template_method = QtWidgets.QComboBox()
         self.combo_template_method.addItem('Amplitude-fit LLR (Gaussian)', 'LLR Probability Vector')
         self.combo_template_method.addItem('Positive-core LLR (experimental)', 'Burst-aware LLR')
@@ -1899,7 +1897,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay_template.addLayout(h_tmode)
 
         h_cs_sigma = QtWidgets.QHBoxLayout()
-        self.lbl_template_cs_sigma = QtWidgets.QLabel('CS response / noise MAD cutoff:')
+        self.lbl_template_cs_sigma = QtWidgets.QLabel('CS match response / noise MAD:')
         h_cs_sigma.addWidget(self.lbl_template_cs_sigma)
         self.spin_template_cs_sigma = QtWidgets.QDoubleSpinBox(); self.spin_template_cs_sigma.setRange(0.01, 100.0); self.spin_template_cs_sigma.setDecimals(3); self.spin_template_cs_sigma.setSingleStep(0.1); self.spin_template_cs_sigma.setValue(float(self.params.get('TEMPLATE_CS_SIGMA', 6.0)))
         self.spin_template_cs_sigma.setToolTip('LLR mode: positive template projection divided by the filtered trace’s unmasked per-sample MAD. Score line is cutoff² / 2; this is not a calibrated false-positive z-score.')
@@ -1907,21 +1905,8 @@ class MainWindow(QtWidgets.QMainWindow):
         h_cs_sigma.addWidget(self.spin_template_cs_sigma)
         lay_template.addLayout(h_cs_sigma)
 
-        h_cs_peak = QtWidgets.QHBoxLayout()
-        self.lbl_template_cs_peak = QtWidgets.QLabel('Min CS filtered-trace peak (× MAD, 0=off):')
-        h_cs_peak.addWidget(self.lbl_template_cs_peak)
-        self.spin_template_cs_peak = QtWidgets.QDoubleSpinBox()
-        self.spin_template_cs_peak.setRange(0.0, 100.0)
-        self.spin_template_cs_peak.setDecimals(2)
-        self.spin_template_cs_peak.setSingleStep(0.1)
-        self.spin_template_cs_peak.setValue(float(self.params.get('TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA', 3.0)))
-        self.spin_template_cs_peak.setToolTip('A CS score peak also needs this much signal in the filtered CS trace at the candidate time, relative to its unmasked per-sample MAD. Applies to both LLR and similarity; 0 disables the check.')
-        self.spin_template_cs_peak.valueChanged.connect(self.on_template_controls_changed)
-        h_cs_peak.addWidget(self.spin_template_cs_peak)
-        lay_template.addLayout(h_cs_peak)
-
         h_ss_sigma = QtWidgets.QHBoxLayout()
-        self.lbl_template_ss_sigma = QtWidgets.QLabel('SS response / noise MAD cutoff:')
+        self.lbl_template_ss_sigma = QtWidgets.QLabel('SS match response / noise MAD:')
         h_ss_sigma.addWidget(self.lbl_template_ss_sigma)
         self.spin_template_ss_sigma = QtWidgets.QDoubleSpinBox(); self.spin_template_ss_sigma.setRange(0.01, 100.0); self.spin_template_ss_sigma.setDecimals(3); self.spin_template_ss_sigma.setSingleStep(0.1); self.spin_template_ss_sigma.setValue(float(self.params.get('TEMPLATE_SS_SIGMA', 3.0)))
         self.spin_template_ss_sigma.setToolTip('LLR mode: positive 3 ms template-core projection divided by the filtered trace’s unmasked per-sample MAD. This is not a calibrated false-positive z-score.')
@@ -1945,17 +1930,8 @@ class MainWindow(QtWidgets.QMainWindow):
         h_ss_sim.addWidget(self.spin_template_ss_sim)
         lay_template.addLayout(h_ss_sim)
 
-        h_min_response = QtWidgets.QHBoxLayout()
-        self.lbl_template_min_response = QtWidgets.QLabel('Min SS response (σ × MAD):')
-        h_min_response.addWidget(self.lbl_template_min_response)
-        self.spin_template_min_response = QtWidgets.QDoubleSpinBox(); self.spin_template_min_response.setRange(0.1, 10.0); self.spin_template_min_response.setDecimals(2); self.spin_template_min_response.setSingleStep(0.1); self.spin_template_min_response.setValue(float(self.params.get('TEMPLATE_MIN_RESPONSE_SIGMA', 2.2)))
-        self.spin_template_min_response.setToolTip('Minimum positive template projection relative to the cell’s SS-trace MAD. In LLR mode this is redundant when the SS response/MAD cutoff is higher; it remains useful for normalized similarity.')
-        self.spin_template_min_response.valueChanged.connect(self.on_template_controls_changed)
-        h_min_response.addWidget(self.spin_template_min_response)
-        lay_template.addLayout(h_min_response)
-
         h_lowpass = QtWidgets.QHBoxLayout()
-        h_lowpass.addWidget(QtWidgets.QLabel('Template SS low-pass (Hz, 0=off):'))
+        h_lowpass.addWidget(QtWidgets.QLabel('SS matching low-pass (Hz):'))
         self.spin_template_lowpass = QtWidgets.QDoubleSpinBox(); self.spin_template_lowpass.setRange(0.0, 5000.0); self.spin_template_lowpass.setDecimals(0); self.spin_template_lowpass.setSingleStep(50.0); self.spin_template_lowpass.setValue(float(self.params.get('TEMPLATE_SS_LOWPASS_HZ', 700.0)))
         self.spin_template_lowpass.valueChanged.connect(self.on_template_controls_changed)
         h_lowpass.addWidget(self.spin_template_lowpass)
@@ -1973,6 +1949,34 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         col2.addWidget(self.tabs_detection)
+
+        self.group_spike_qc = QtWidgets.QGroupBox('Spike QC')
+        qc_grid = QtWidgets.QGridLayout(self.group_spike_qc)
+        qc_grid.setContentsMargins(10, 6, 10, 8)
+        qc_grid.setHorizontalSpacing(8)
+        qc_grid.setVerticalSpacing(5)
+        self.qc_inputs = {}
+        for row, kind in enumerate(('CS', 'SS')):
+            qc_grid.addWidget(QtWidgets.QLabel(kind), row, 0)
+            for col, (suffix, label) in enumerate((('MIN_AMPLITUDE_SNR', 'Min amp. SNR'),
+                    ('MIN_FWHM_MS', 'Min FWHM'), ('MAX_FWHM_MS', 'Max FWHM'))):
+                key = f'{kind}_{suffix}'
+                spin = QtWidgets.QDoubleSpinBox()
+                spin.setRange(0, 1000)
+                spin.setDecimals(2)
+                spin.setSingleStep(0.1)
+                spin.setValue(self.params[key])
+                if suffix.endswith('_MS'):
+                    spin.setSuffix(' ms')
+                    description = ('Minimum' if suffix.startswith('MIN') else 'Maximum') + f' {kind} FWHM on the filtered detection trace before whitening. 0 disables this limit. Unmeasurable widths are retained and flagged.'
+                else:
+                    description = f'Minimum {kind} amplitude SNR on the original frame-processed, baseline-corrected trace before denoising/filtering/whitening: candidate height above −25…−5 ms baseline / Gaussian-scaled noise MAD from −150…−5 ms, excluding candidate spikes. 0 disables; unavailable SNR is rejected when enabled.'
+                _set_input_tooltip(spin, description)
+                spin.valueChanged.connect(lambda value, name=key: self.params.__setitem__(name, float(value)))
+                self.qc_inputs[key] = spin
+                qc_grid.addWidget(QtWidgets.QLabel(label), row, 1 + col * 2)
+                qc_grid.addWidget(spin, row, 2 + col * 2)
+        col2.addWidget(self.group_spike_qc)
 
         # place Spike Detection and Spike Stats side-by-side with equal stretch
         h_detect = QtWidgets.QVBoxLayout()
@@ -1999,7 +2003,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         h_detect_top = QtWidgets.QHBoxLayout()
         h_detect_top.addWidget(btn_detect)
-        self.chk_detection_save = QtWidgets.QCheckBox('save')
+        self.chk_detection_save = QtWidgets.QCheckBox('Save')
         self.chk_detection_save.setChecked(bool(self.params.get('SAVE_DETECTION_RESULTS', False)))
         self.chk_detection_save.stateChanged.connect(
             lambda _v: self.params.__setitem__('SAVE_DETECTION_RESULTS', bool(self.chk_detection_save.isChecked()))
@@ -2010,7 +2014,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         h_detect_top.addWidget(self.chk_detection_save)
         h_detect.addLayout(h_detect_top)
-        h_detect.setSpacing(3)
+        h_detect.setSpacing(5)
         h_batch_stats = QtWidgets.QHBoxLayout()
         h_batch_stats.addWidget(btn_batch, 1)
         h_batch_stats.addWidget(btn_stats, 1)
@@ -2018,7 +2022,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Column 3: advanced settings and info panel
         col3.addLayout(h_detect)
-        col3.addSpacing(2)
+        col3.addSpacing(6)
         h_cfg = QtWidgets.QHBoxLayout()
         btn_load_cfg = QtWidgets.QPushButton('Load Settings')
         btn_save_cfg = QtWidgets.QPushButton('Save Settings')
@@ -2129,8 +2133,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _sync_polarity_buttons(self):
         negative = bool(self.params.get('NEGATIVE_GOING', True))
-        self.btn_polarity_positive.setChecked(not negative)
-        self.btn_polarity_negative.setChecked(negative)
+        self.tabs_polarity.blockSignals(True)
+        self.tabs_polarity.setCurrentIndex(int(negative))
+        self.tabs_polarity.blockSignals(False)
+
+    def _restore_qc_controls(self, params):
+        for key, spin in self.qc_inputs.items():
+            spin.blockSignals(True)
+            spin.setValue(float(params.get(key, QC_DEFAULTS[key])))
+            spin.blockSignals(False)
 
     def on_polarity_changed(self, negative):
         self.params['NEGATIVE_GOING'] = bool(negative)
@@ -2151,7 +2162,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_combo_changed(self, checked):
         self.params['COMBO_DETECTION'] = bool(checked)
         for kind, label in (('CS', self.lbl_cs_threshold), ('SS', self.lbl_ss_threshold)):
-            label.setText('Seed (σ, 0=off):' if checked else 'Threshold (σ, 0=off):')
+            label.setText('Seed (σ):' if checked else 'Threshold (σ):')
 
     def on_template_controls_changed(self):
         try:
@@ -2161,11 +2172,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.params['TEMPLATE_WHITENING'] = bool(self.chk_template_whitening.isChecked())
             self.params['TEMPLATE_PARALLEL_GROUPS'] = int(self.spin_template_groups.value())
             self.params['TEMPLATE_CS_SIGMA'] = float(self.spin_template_cs_sigma.value())
-            self.params['TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA'] = float(self.spin_template_cs_peak.value())
             self.params['TEMPLATE_SS_SIGMA'] = float(self.spin_template_ss_sigma.value())
             self.params['TEMPLATE_CS_SIMILARITY'] = float(self.spin_template_cs_sim.value())
             self.params['TEMPLATE_SS_SIMILARITY'] = float(self.spin_template_ss_sim.value())
-            self.params['TEMPLATE_MIN_RESPONSE_SIGMA'] = float(self.spin_template_min_response.value())
             self.params['TEMPLATE_SS_LOWPASS_HZ'] = float(self.spin_template_lowpass.value())
             llr = method != 'Normalized Similarity'
             for widget in (self.lbl_template_cs_sigma, self.spin_template_cs_sigma,
@@ -2427,6 +2436,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_ss_fwhm_filter(self, res, sdata, cell_idx):
         """Retain uncertain widths, but distinguish them from measured passes."""
+        if 'spike_qc' in res:
+            return res
         peaks = np.asarray(res.get('ss_peaks', []), dtype=int)
         cs_peaks = np.asarray(res.get('cs_peaks', []), dtype=int)
         source = self._get_waveform_source_trace_for_stats(sdata, cell_idx)
@@ -2439,8 +2450,8 @@ class MainWindow(QtWidgets.QMainWindow):
         res['ss_width_source'] = 'filtered SS detection trace' if template_mode else 'baseline-corrected trace'
         rows = measure_widths(width_source, peaks, float(sdata['fs']), _stats_window_ms('SS'),
                               neighbors=cs_peaks, align_ms=res.get('width_alignment_ms', 0))
-        enabled = bool(self.params.get('SS_MAX_FWHM_FILTER_ENABLED', True))
         limit = float(self.params.get('SS_MAX_FWHM_MS', 4.5))
+        enabled = limit > 0
         keep = []
         for row in rows:
             if np.isfinite(row['fwhm_ms']):
@@ -2886,6 +2897,7 @@ class MainWindow(QtWidgets.QMainWindow):
             loaded_colors = cfg.get('colors', {})
             loaded_ui = cfg.get('ui', {})
             loaded_template_sources = cfg.get('template_sources')
+            legacy_qc = isinstance(loaded_params, dict) and any(key in loaded_params for key in LEGACY_QC_KEYS)
 
             if isinstance(loaded_params, dict):
                 if 'DETECTION_OVERRIDE' in loaded_params:
@@ -2896,6 +2908,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     for key in ('SS_MASK_PRE_MS', 'SS_MASK_POST_MS'):
                         if key not in loaded_params:
                             self.params.pop(key, None)
+                loaded_params = migrate_qc_settings(loaded_params)
+                for key in LEGACY_QC_KEYS:
+                    self.params.pop(key, None)
                 self.params.update(loaded_params)
             if isinstance(loaded_baseline, dict):
                 self.baseline_params.update(loaded_baseline)
@@ -2905,6 +2920,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Read every saved control from this stable copy instead.
             settings_params = dict(self.params)
             self._sync_polarity_buttons()
+            self._restore_qc_controls(settings_params)
 
             missing_templates = []
             if isinstance(loaded_template_sources, dict):
@@ -2996,11 +3012,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.spin_template_groups.setValue(int(settings_params.get('TEMPLATE_PARALLEL_GROUPS', 3)))
                 self.spin_template_groups.blockSignals(False)
                 self.spin_template_cs_sigma.setValue(float(settings_params.get('TEMPLATE_CS_SIGMA', self.spin_template_cs_sigma.value())))
-                self.spin_template_cs_peak.setValue(float(settings_params.get('TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA', 3.0)))
                 self.spin_template_ss_sigma.setValue(float(settings_params.get('TEMPLATE_SS_SIGMA', self.spin_template_ss_sigma.value())))
                 self.spin_template_cs_sim.setValue(float(settings_params.get('TEMPLATE_CS_SIMILARITY', self.spin_template_cs_sim.value())))
                 self.spin_template_ss_sim.setValue(float(settings_params.get('TEMPLATE_SS_SIMILARITY', self.spin_template_ss_sim.value())))
-                self.spin_template_min_response.setValue(float(settings_params.get('TEMPLATE_MIN_RESPONSE_SIGMA', self.spin_template_min_response.value())))
                 self.spin_template_lowpass.setValue(float(settings_params.get('TEMPLATE_SS_LOWPASS_HZ', self.spin_template_lowpass.value())))
                 self.chk_local_baseline.setChecked(bool(settings_params.get('LOCAL_BASELINE', self.chk_local_baseline.isChecked())))
                 self.spin_local_ss_ms.setValue(float(settings_params.get('LOCAL_BASELINE_SS_MS', self.spin_local_ss_ms.value())))
@@ -3029,10 +3043,10 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self.update_plot()
-            note = ''
+            note = ('\n\nSpike QC now controls amplitude SNR and width for every detection mode. Old projection/filtered-height gates were removed; they are not amplitude SNR. Review Spike QC before rerunning.' if legacy_qc else '')
             if (cfg.get('app_version') != APP_VERSION and
                     self.params.get('TEMPLATE_MATCH_METHOD') == 'LLR Probability Vector'):
-                note = ('\n\nReview the LLR CS/SS response/MAD cutoffs when loading settings '
+                note += ('\n\nReview the LLR CS/SS response/MAD cutoffs when loading settings '
                         'from a different app version.')
                 self.text_stats.append(note.strip())
             if missing_templates:
@@ -3554,6 +3568,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                             valid_duration_cs_s=np.sum(~cs_masks, axis=0)/fs_save,
                                             valid_duration_ss_s=np.sum(~ss_masks, axis=0)/fs_save,
                                             width_quality_json=json.dumps(width_report, allow_nan=False),
+                                            spike_qc_json=json.dumps([r.get('spike_qc', {}) for r in data['results']], allow_nan=False),
                                             time_ms=time_ms,
                                             raw_data=raw_data,
                                             processed_raw_data=processed_raw_data,
@@ -3775,35 +3790,29 @@ class MainWindow(QtWidgets.QMainWindow):
                         summary.append(f"Noise whitening: {'ON' if self.params.get('TEMPLATE_WHITENING', False) else 'OFF'}; "
                             f"applied to {whitening_counts['applied']} cell/type tracks, skipped {whitening_counts['skipped']}" +
                             (f" ({'; '.join(sorted(whitening_reasons))})" if whitening_reasons else ''))
-                        summary.append(f"Template SS low-pass: {self.params.get('TEMPLATE_SS_LOWPASS_HZ', 700.0):g} Hz (0=off); SS widths measured on filtered detection trace")
+                        summary.append(f"Template SS low-pass: {self.params.get('TEMPLATE_SS_LOWPASS_HZ', 700.0):g} Hz; SS widths measured on filtered detection trace")
                         if self.params.get('TEMPLATE_MATCH_METHOD') == 'Normalized Similarity':
                             summary.append(
                                 f"Similarity thresholds: CS r={self.params.get('TEMPLATE_CS_SIMILARITY', 0.90):.2f}, "
                                 f"SS r={self.params.get('TEMPLATE_SS_SIMILARITY', 0.80):.2f}; "
-                                f"minimum SS response={self.params.get('TEMPLATE_MIN_RESPONSE_SIGMA', 2.2):.2f}xMAD"
+                                "amplitude/width checks use Spike QC"
                             )
                         else:
                             summary.append(
                                 f"Template response/MAD cutoffs (not calibrated z-scores): "
                                 f"CS={self.params.get('TEMPLATE_CS_SIGMA', 6.0):.2f}, "
                                 f"SS={self.params.get('TEMPLATE_SS_SIGMA', 3.0):.2f}; "
-                                f"minimum SS response={self.params.get('TEMPLATE_MIN_RESPONSE_SIGMA', 2.2):.2f}xMAD"
+                                "amplitude/width checks use Spike QC"
                             )
                             if self.params.get('TEMPLATE_MATCH_METHOD') == 'Burst-aware LLR':
                                 summary.append('Experimental positive-core SS: positive 3 ms template core; '
                                     'no anchor, proximity, or full-waveform correlation gate. '
                                     'CS uses standard amplitude-fit LLR.')
-                        summary.append(
-                            f"CS matched-response floor={max(3.0, self.params.get('TEMPLATE_MIN_RESPONSE_SIGMA', 2.2)):.2f}xMAD; "
-                            f"filtered CS trace at candidate ≥{self.params.get('TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA', 3.0):.2f}xMAD "
-                            '(0 disables center-peak gate).')
                         for spike_type in ('cs', 'ss'):
                             reports = [r.get(f'{spike_type}_candidate_diagnostics', {})
                                        for name in completed_names for r in self.loaded_sessions[name]['results'] if r is not None]
                             counts = [('score peaks', 'score_peaks'), ('masked', 'masked'),
                                       ('matched response rejected', 'response_rejected')]
-                            if spike_type == 'cs':
-                                counts.append(('filtered peak rejected', 'peak_rejected'))
                             counts.append(('spacing rejected', 'refractory_rejected'))
                             summary.append(f"{spike_type.upper()} candidates: " + ', '.join(
                                 f'{label} {sum(int(report.get(key, 0)) for report in reports)}'
@@ -3814,10 +3823,19 @@ class MainWindow(QtWidgets.QMainWindow):
                             f"CS FWHM > {self.params.get('CS_MIN_FWHM_MS', 4.0):.2f} ms, "
                             f"SS min distance = {self.params.get('SS_MIN_DIST_MS', 4.0):.2f} ms, "
                             f"SS pre/post exclusion = {mask_windows(self.params)[0]:.2f}/{mask_windows(self.params)[1]:.2f} ms, "
-                            f"SS max FWHM filter = {'ON' if bool(self.params.get('SS_MAX_FWHM_FILTER_ENABLED', True)) else 'OFF'} "
+                            f"SS max FWHM = "
                             f"({self.params.get('SS_MAX_FWHM_MS', 4.5):.2f} ms), "
                             f"initial blank = {self.params.get('INITIAL_BLANK_MS', 150.0):.2f} ms"
                         )
+                    summary.append('Spike QC: ' + '; '.join(
+                        f"{kind}: min amplitude SNR {self.params[f'{kind}_MIN_AMPLITUDE_SNR']:g}, FWHM {self.params[f'{kind}_MIN_FWHM_MS']:g}–{self.params[f'{kind}_MAX_FWHM_MS']:g} ms" for kind in ('CS', 'SS')))
+                    for kind in ('cs', 'ss'):
+                        qc_reports = [r.get('spike_qc', {}).get(kind, {}) for name in completed_names
+                                      for r in self.loaded_sessions[name]['results'] if r is not None]
+                        summary.append(f'{kind.upper()} QC: ' + ', '.join(
+                            f"{label} {sum(report.get(key, 0) for report in qc_reports)}"
+                            for label, key in [('amplitude SNR rejected', 'amplitude_rejected'),
+                                ('SNR unavailable', 'amplitude_unavailable'), ('width rejected', 'width_rejected')] ))
                     summary.append('Overall CS:')
                     summary.append(f'  Rate: {cs_r_mean:.2f}±{cs_r_std:.2f} Hz (cells: {cs_r_n}) | SNR: {cs_snr_mean:.2f}±{cs_snr_std:.2f} (events: {cs_snr_n}) | FWHM: {cs_fwhm_mean:.2f}±{cs_fwhm_std:.2f} ms (events: {cs_fwhm_n})')
                     summary.append('Overall SS:')
@@ -3900,12 +3918,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 'CS_THRESHOLD_SIGMA': 6.0,
                 'CS_MIN_DIST_MS': 25.0,
                 'CS_MIN_FWHM_MS': 4.0,
+                'CS_MAX_FWHM_MS': 0.0,
+                'CS_MIN_AMPLITUDE_SNR': 0.0,
+                'SS_MIN_AMPLITUDE_SNR': 0.0,
+                'SS_MIN_FWHM_MS': 0.0,
                 'SS_LOW_CUT_HZ': 0.0,
                 'SS_HIGH_CUT_HZ': 0.0,
                 'SS_THRESHOLD_SIGMA': 2.5,
                 'SS_MIN_DIST_MS': 4.0,
                 'SS_BLANK_MS': 18.0,
-                'SS_MAX_FWHM_FILTER_ENABLED': True,
                 'SS_MAX_FWHM_MS': 4.5,
                 'INITIAL_BLANK_MS': 150.0,
                 'CS_FILTER_ORDER': 4,
@@ -3921,11 +3942,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 'TEMPLATE_CS_SELECTED_GROUPS': None,
                 'TEMPLATE_SS_SELECTED_GROUPS': None,
                 'TEMPLATE_CS_SIGMA': 6.0,
-                'TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA': 3.0,
                 'TEMPLATE_SS_SIGMA': 3.0,
                 'TEMPLATE_CS_SIMILARITY': 0.90,
                 'TEMPLATE_SS_SIMILARITY': 0.80,
-                'TEMPLATE_MIN_RESPONSE_SIGMA': 2.2,
                 'TEMPLATE_SS_LOWPASS_HZ': 700.0,
                 'LOCAL_BASELINE': False,
                 'LOCAL_BASELINE_SS_MS': 50.0,
@@ -3952,8 +3971,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 'RAW_SCALE_BAR_UNIT': 'Sigma',
                 'STATS_CS_BG_ALPHA': 0.3,
                 'STATS_SS_BG_ALPHA': 0.003,
+                'DETECTION_VIEW_WINDOW_MS': 500.0,
+                'DETECTION_VIEW_Y_RANGE': 0.0,
+                'DETECTION_VIEW_CENTER': 200,
+                'SLIDER_VIEW_Y_RANGE': 0.0,
+                'SLIDER_VIEW_CENTER': 200,
+                'DENOISE_SHOW_ADVANCED': False,
             }
             self._sync_polarity_buttons()
+            self._restore_qc_controls(self.params)
             _set_user_linewidth_scale(self.params.get('LINE_WIDTH_SCALE', 0.7))
             self.template_store = {
                 'cs_templates': [],
@@ -3992,11 +4018,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.chk_template_whitening.setChecked(False)
                 self.spin_template_groups.setValue(self.params['TEMPLATE_PARALLEL_GROUPS'])
                 self.spin_template_cs_sigma.setValue(self.params['TEMPLATE_CS_SIGMA'])
-                self.spin_template_cs_peak.setValue(self.params['TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA'])
                 self.spin_template_ss_sigma.setValue(self.params['TEMPLATE_SS_SIGMA'])
                 self.spin_template_cs_sim.setValue(self.params['TEMPLATE_CS_SIMILARITY'])
                 self.spin_template_ss_sim.setValue(self.params['TEMPLATE_SS_SIMILARITY'])
-                self.spin_template_min_response.setValue(self.params['TEMPLATE_MIN_RESPONSE_SIGMA'])
                 self.spin_template_lowpass.setValue(self.params['TEMPLATE_SS_LOWPASS_HZ'])
                 if hasattr(self, 'chk_local_baseline') and self.chk_local_baseline is not None:
                     self.chk_local_baseline.setChecked(False)
@@ -4547,13 +4571,13 @@ class DetectionSettingsDialog(QtWidgets.QDialog):
         self.spin_ss_low = QtWidgets.QDoubleSpinBox(); self.spin_ss_low.setRange(0.0,5000.0); self.spin_ss_low.setValue(p.get('SS_LOW_CUT_HZ',0.0))
         self.spin_ss_high = QtWidgets.QDoubleSpinBox(); self.spin_ss_high.setRange(0.0,5000.0); self.spin_ss_high.setValue(p.get('SS_HIGH_CUT_HZ',0.0))
         self.spin_ss_thresh = QtWidgets.QDoubleSpinBox(); self.spin_ss_thresh.setRange(0.0,50.0); self.spin_ss_thresh.setValue(p.get('SS_THRESHOLD_SIGMA',2.5))
-        form.addRow('CS low cut (Hz, 0=off):', self.spin_cs_low)
-        form.addRow('CS high cut (Hz, 0=off):', self.spin_cs_high)
-        form.addRow('CS threshold (sigma, 0=off):', self.spin_cs_thresh)
+        form.addRow('CS low cut (Hz):', self.spin_cs_low)
+        form.addRow('CS high cut (Hz):', self.spin_cs_high)
+        form.addRow('CS threshold (σ):', self.spin_cs_thresh)
         # CS min dist is managed in Advanced Settings (SettingsDialog)
-        form.addRow('SS low cut (Hz, 0=off):', self.spin_ss_low)
-        form.addRow('SS high cut (Hz, 0=off):', self.spin_ss_high)
-        form.addRow('SS threshold (sigma, 0=off):', self.spin_ss_thresh)
+        form.addRow('SS low cut (Hz):', self.spin_ss_low)
+        form.addRow('SS high cut (Hz):', self.spin_ss_high)
+        form.addRow('SS threshold (σ):', self.spin_ss_thresh)
         # SS min dist / SS blank moved to Advanced Settings (use parent.params)
         layout.addLayout(form)
         btns = QtWidgets.QHBoxLayout()
@@ -4628,11 +4652,16 @@ class SliderViewerDialog(QtWidgets.QDialog):
         self.slider_time.setOrientation(ORIENT_HORIZONTAL)
         self.slider_time.setMinimum(0)
         self.slider_time.setMaximum(1000)
-        self.slider_time.setValue(200)
+        view_params = getattr(parent, 'params', {})
+        self.slider_time.setValue(int(view_params.get('SLIDER_VIEW_CENTER', 200)))
         self.slider_time.valueChanged.connect(self.update_plot)
 
-        self.spin_zoom = QtWidgets.QDoubleSpinBox(); self.spin_zoom.setRange(0.0, 1e6); self.spin_zoom.setValue(0.0)
+        self.spin_zoom = QtWidgets.QDoubleSpinBox(); self.spin_zoom.setRange(0.0, 1e6); self.spin_zoom.setValue(float(view_params.get('SLIDER_VIEW_Y_RANGE', 0.0)))
         self.spin_zoom.valueChanged.connect(self.update_plot)
+        if parent is not None and hasattr(parent, 'params'):
+            controls = [('SLIDER_VIEW_CENTER', self.slider_time), ('SLIDER_VIEW_Y_RANGE', self.spin_zoom)]
+            for key, widget in controls:
+                widget.valueChanged.connect(lambda value, name=key: parent.params.__setitem__(name, value))
 
         # Controls row (move on top of plot)
         layout = QtWidgets.QVBoxLayout()
@@ -4640,7 +4669,7 @@ class SliderViewerDialog(QtWidgets.QDialog):
         # start time label
         self.lbl_start_time = QtWidgets.QLabel('Start: 0 ms')
         hl.addWidget(self.lbl_start_time)
-        hl.addWidget(QtWidgets.QLabel('Y-Range (0=auto):')); hl.addWidget(self.spin_zoom)
+        hl.addWidget(QtWidgets.QLabel('Y-Range:')); hl.addWidget(self.spin_zoom)
         # Export button
         btn_export = QtWidgets.QPushButton('Save Figure')
         btn_export.clicked.connect(self.save_figure)
@@ -4842,13 +4871,19 @@ class DetectionViewerDialog(QtWidgets.QDialog):
         self.slider_time.setOrientation(ORIENT_HORIZONTAL)
         self.slider_time.setMinimum(0)
         self.slider_time.setMaximum(1000)
-        self.slider_time.setValue(200)
+        view_params = getattr(parent, 'params', {})
+        self.slider_time.setValue(int(view_params.get('DETECTION_VIEW_CENTER', 200)))
         self.slider_time.valueChanged.connect(self.plot_detection)
 
-        self.spin_window = QtWidgets.QDoubleSpinBox(); self.spin_window.setRange(10.0, 10000.0); self.spin_window.setValue(500.0)
+        self.spin_window = QtWidgets.QDoubleSpinBox(); self.spin_window.setRange(10.0, 10000.0); self.spin_window.setValue(float(view_params.get('DETECTION_VIEW_WINDOW_MS', 500.0)))
         self.spin_window.valueChanged.connect(self.plot_detection)
-        self.spin_zoom = QtWidgets.QDoubleSpinBox(); self.spin_zoom.setRange(0.0, 1e6); self.spin_zoom.setValue(0.0)
+        self.spin_zoom = QtWidgets.QDoubleSpinBox(); self.spin_zoom.setRange(0.0, 1e6); self.spin_zoom.setValue(float(view_params.get('DETECTION_VIEW_Y_RANGE', 0.0)))
         self.spin_zoom.valueChanged.connect(self.plot_detection)
+        if parent is not None and hasattr(parent, 'params'):
+            controls = [('DETECTION_VIEW_CENTER', self.slider_time), ('DETECTION_VIEW_Y_RANGE', self.spin_zoom)]
+            controls.append(('DETECTION_VIEW_WINDOW_MS', self.spin_window))
+            for key, widget in controls:
+                widget.valueChanged.connect(lambda value, name=key: parent.params.__setitem__(name, value))
 
         # Two-row control panel to avoid overly wide layout
         ctrl_top = QtWidgets.QHBoxLayout()
@@ -5155,7 +5190,7 @@ class DetectionViewerDialog(QtWidgets.QDialog):
         self.btn_polarity_control.setEnabled(bool(is_template_mode and
             self.data.get('_control_context') and self._polarity_control_thread is None and
             all(f'{kind}_exclusion_mask' in res for kind in ('cs', 'ss'))))
-        if is_template_mode:
+        if is_template_mode or 'spike_qc' in res:
             messages = []
             for spike_type in ('CS', 'SS'):
                 info = res.get(f'{spike_type.lower()}_candidate_diagnostics', {})
@@ -5166,10 +5201,12 @@ class DetectionViewerDialog(QtWidgets.QDialog):
                                      if spike_type == 'CS' else res.get('ss_fwhm_filter_removed', 0))
                     width_uncertain = (sum(row.get('status') == 'uncertain' for row in res.get('event_widths_cs', []))
                                        if spike_type == 'CS' else res.get('ss_fwhm_filter_uncertain', 0))
-                    losses = (f"score peaks {info.get('score_peaks', 0)}, masked {info.get('masked', 0)}, "
-                              f"matched response rejected {info.get('response_rejected', 0)}")
-                    if spike_type == 'CS':
-                        losses += f", filtered peak rejected {info.get('peak_rejected', 0)}"
+                    losses = (f"score peaks {info.get('score_peaks', 0)}, masked {info.get('masked', 0)}"
+                              if is_template_mode else f"QC candidates {len(res.get(spike_type.lower() + '_width_candidates', []))}")
+                    qc = res.get('spike_qc', {}).get(spike_type.lower(), {})
+                    if qc:
+                        width_removed = qc['width_rejected']
+                    losses += f", amplitude SNR rejected {qc.get('amplitude_rejected', 0)}, SNR unavailable {qc.get('amplitude_unavailable', 0)}"
                     uncertain_label = (f'{width_uncertain} (short green dashes)' if spike_type == 'CS'
                                        else str(width_uncertain))
                     messages.append(f"{spike_type}: {losses}, "
@@ -6282,12 +6319,8 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow(self.chk_denoise_cs)
         # CS min dist and SS-specific params moved into Advanced Settings
         self.spin_cs_mind = QtWidgets.QDoubleSpinBox(); self.spin_cs_mind.setRange(0.0,1000.0); self.spin_cs_mind.setValue(p.get('CS_MIN_DIST_MS', 25.0))
-        self.spin_cs_min_fwhm = QtWidgets.QDoubleSpinBox(); self.spin_cs_min_fwhm.setRange(0.0,1000.0); self.spin_cs_min_fwhm.setDecimals(2); self.spin_cs_min_fwhm.setValue(p.get('CS_MIN_FWHM_MS', 4.0))
         self.spin_ss_mind = QtWidgets.QDoubleSpinBox(); self.spin_ss_mind.setRange(0.0,1000.0); self.spin_ss_mind.setValue(p.get('SS_MIN_DIST_MS', 4.0))
         self.spin_ss_blank = QtWidgets.QDoubleSpinBox(); self.spin_ss_blank.setRange(0.0,1000.0); self.spin_ss_blank.setValue(p.get('SS_BLANK_MS', 18.0))
-        self.chk_ss_max_fwhm = QtWidgets.QCheckBox('Discard broad SS by FWHM')
-        self.chk_ss_max_fwhm.setChecked(bool(p.get('SS_MAX_FWHM_FILTER_ENABLED', True)))
-        self.spin_ss_max_fwhm = QtWidgets.QDoubleSpinBox(); self.spin_ss_max_fwhm.setRange(0.1,1000.0); self.spin_ss_max_fwhm.setDecimals(2); self.spin_ss_max_fwhm.setValue(p.get('SS_MAX_FWHM_MS', 4.5))
         self.spin_initial_blank = QtWidgets.QDoubleSpinBox(); self.spin_initial_blank.setRange(0.0,5000.0); self.spin_initial_blank.setValue(p.get('INITIAL_BLANK_MS', 150.0))
         self.spin_tpl_cs_window = QtWidgets.QDoubleSpinBox(); self.spin_tpl_cs_window.setRange(1.0,200.0); self.spin_tpl_cs_window.setDecimals(1); self.spin_tpl_cs_window.setValue(p.get('TEMPLATE_CS_WINDOW_MS', 30.0))
         self.spin_tpl_ss_window = QtWidgets.QDoubleSpinBox(); self.spin_tpl_ss_window.setRange(1.0,100.0); self.spin_tpl_ss_window.setDecimals(1); self.spin_tpl_ss_window.setValue(p.get('TEMPLATE_SS_WINDOW_MS', 8.0))
@@ -6296,11 +6329,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.spin_line_scale = QtWidgets.QDoubleSpinBox(); self.spin_line_scale.setRange(0.2,5.0); self.spin_line_scale.setDecimals(2); self.spin_line_scale.setSingleStep(0.1); self.spin_line_scale.setValue(float(p.get('LINE_WIDTH_SCALE', 0.7)))
         self.combo_raw_scale_unit = QtWidgets.QComboBox()
         self.combo_raw_scale_unit.addItem('MAD-based σ', 'Sigma')
-        self.combo_raw_scale_unit.addItem('dF/F (%)', 'dF/F (%)')
+        self.combo_raw_scale_unit.addItem('ΔF/F (%)', 'dF/F (%)')
         self.combo_raw_scale_unit.setCurrentIndex(max(0, self.combo_raw_scale_unit.findData(
             str(p.get('RAW_SCALE_BAR_UNIT', 'Sigma')))))
         form.addRow('CS min dist (ms):', self.spin_cs_mind)
-        form.addRow('CS min FWHM (ms):', self.spin_cs_min_fwhm)
         form.addRow('SS min dist (ms):', self.spin_ss_mind)
         pre, post = mask_windows(p)
         self.spin_ss_mask_pre = QtWidgets.QDoubleSpinBox()
@@ -6310,8 +6342,6 @@ class SettingsDialog(QtWidgets.QDialog):
             widget.setValue(value)
         form.addRow('SS exclusion before CS (ms):', self.spin_ss_mask_pre)
         form.addRow('SS exclusion after CS (ms):', self.spin_ss_mask_post)
-        form.addRow(self.chk_ss_max_fwhm)
-        form.addRow('SS max FWHM (ms):', self.spin_ss_max_fwhm)
         form.addRow('Initial blank (ms):', self.spin_initial_blank)
         form.addRow('Template CS window (ms):', self.spin_tpl_cs_window)
         form.addRow('Template SS window (ms):', self.spin_tpl_ss_window)
@@ -6382,12 +6412,9 @@ class SettingsDialog(QtWidgets.QDialog):
         # Apply SS settings
         try:
             self.parent_win.params['CS_MIN_DIST_MS'] = float(self.spin_cs_mind.value())
-            self.parent_win.params['CS_MIN_FWHM_MS'] = float(self.spin_cs_min_fwhm.value())
             self.parent_win.params['SS_MIN_DIST_MS'] = float(self.spin_ss_mind.value())
             self.parent_win.params['SS_MASK_PRE_MS'] = float(self.spin_ss_mask_pre.value())
             self.parent_win.params['SS_MASK_POST_MS'] = float(self.spin_ss_mask_post.value())
-            self.parent_win.params['SS_MAX_FWHM_FILTER_ENABLED'] = bool(self.chk_ss_max_fwhm.isChecked())
-            self.parent_win.params['SS_MAX_FWHM_MS'] = float(self.spin_ss_max_fwhm.value())
             self.parent_win.params['INITIAL_BLANK_MS'] = float(self.spin_initial_blank.value())
             self.parent_win.params['TEMPLATE_CS_WINDOW_MS'] = float(self.spin_tpl_cs_window.value())
             self.parent_win.params['TEMPLATE_SS_WINDOW_MS'] = float(self.spin_tpl_ss_window.value())
@@ -6494,7 +6521,7 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
         left_layout.addWidget(group_tf)
 
         self.chk_show_advanced = QtWidgets.QCheckBox('Show advanced settings')
-        self.chk_show_advanced.setChecked(False)
+        self.chk_show_advanced.setChecked(bool(p.get('DENOISE_SHOW_ADVANCED', False)))
         self.chk_show_advanced.toggled.connect(self._toggle_advanced)
         left_layout.addWidget(self.chk_show_advanced)
 
@@ -6509,7 +6536,7 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
 
         group_thr = QtWidgets.QGroupBox('Adaptive threshold and attenuation')
         form_thr = QtWidgets.QFormLayout()
-        form_thr.addRow('Adaptive threshold sigma:', self.spin_thr_sigma)
+        form_thr.addRow('Envelope threshold (SD):', self.spin_thr_sigma)
         form_thr.addRow('Min attenuation factor:', self.spin_att_min)
         form_thr.addRow(self.chk_soft)
         group_thr.setLayout(form_thr)
@@ -6532,7 +6559,7 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
         left_layout.addWidget(group_adv)
 
         self._advanced_groups = [group_cluster, group_evt, group_adv]
-        self._toggle_advanced(False)
+        self._toggle_advanced(self.chk_show_advanced.isChecked())
         left_layout.addStretch(1)
 
         scroll = QtWidgets.QScrollArea()
@@ -6664,7 +6691,7 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
             if float(cfg.get('f_min_hz', 0.0)) >= 100.0:
                 notes.append('high min freq removes subthreshold/slow components')
             if float(cfg.get('threshold_sigma', 1.5)) <= 1.1:
-                notes.append('low threshold sigma is aggressive')
+                notes.append('Low envelope cutoff preserves more frames before PC1 refinement')
             if float(cfg.get('attenuation_min', 0.25)) <= 0.10:
                 notes.append('very low attenuation can strongly suppress below-threshold frames')
             if int(cfg.get('n_freqs', 72)) <= 32:
@@ -6679,7 +6706,7 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
                         notes.append(f'{frac:.0f}% of frames attenuated')
         except Exception:
             pass
-        return '; '.join(notes) if notes else 'settings look moderate'
+        return '; '.join(notes) if notes else 'No parameter extremes flagged; inspect waveform preservation'
 
     def run_preview(self):
         if self.parent_win is None or not hasattr(self.parent_win, '_get_current_corrected_signal_full'):
@@ -6883,24 +6910,16 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
 
     def show_tips(self):
         tips = (
-            '<b>Adaptive wavelet denoising tips</b><br><br>'
-            '<b>What this method does</b><br>'
-            'The trace is transformed with a complex Morlet wavelet, normalized per frequency, grouped into Ward frequency clusters after PCA elbow selection, thresholded per cluster, reconstructed per cluster, and then integrated back into one denoised trace.<br><br>'
-            '<b>Good starting point</b><br>'
-            'For your AOD voltage traces with 500-1000 Hz shot noise, start with 3-1000 Hz, 72 frequency bins, max clusters = 20, threshold sigma = 1.5, attenuation factor = 0.25, and moving cycles = 1.0. The max frequency is automatically capped below Nyquist if the sampling rate is lower. Keep event refinement ON when isolated high-frequency events remain.<br><br>'
-            '<b>How to read the preview</b><br>'
-            '- <i>Input vs denoised trace</i>: real spikes and slow events should keep their timing and shape; high-frequency noise should shrink.<br>'
-            '- <i>Complex Morlet power</i>: bright vertical bands are transient events; persistent horizontal bands often indicate frequency-specific noise.<br>'
-            '- <i>Attenuation multiplier</i>: 1 means untouched; lower values mark frames attenuated by cluster thresholds or event-PC rejection.<br>'
-            '- <i>Ward frequency clusters</i>: nearby frequencies with similar temporal behavior should group together. Too many fragmented clusters can make masks unstable.<br>'
-            '- <i>Cluster threshold gates</i>: signal above dashed threshold is preserved; below-threshold frames are attenuated for that cluster.<br>'
-            '- <i>Event PC1 rejection</i>: events below the cutoff are treated as atypical/noisy for their cluster and attenuated.<br><br>'
-            '<b>Tuning advice</b><br>'
-            '- If spikes are flattened or CS shoulders shrink, increase attenuation factor toward 0.5-0.8, increase threshold sigma toward 2.0-2.5, or reduce max frequency to 700-800 Hz.<br>'
-            '- If 500-1000 Hz shot noise remains, lower attenuation factor toward 0.1-0.25, reduce threshold sigma toward 1.0-1.5, increase frequency bins to 96, or keep max frequency near 1000 Hz when the sampling rate allows it.<br>'
-            '- If slow depolarizations are distorted, raise min frequency from 3 Hz only cautiously; usually adjust threshold/attenuation before changing min frequency.<br>'
-            '- If cluster maps look fragmented, reduce frequency bins or max clusters. If broad high-frequency noise is mixed with spikes, increase frequency bins or max clusters.<br>'
-            '- If preview is slow, reduce frequency bins first, then reduce max timepoints for clustering. These speed changes affect clustering detail but not the basic detection settings.'
+            '<b>Adaptive wavelet denoising</b><br><br>'
+            'The complex Morlet representation is normalized per frequency, grouped into frequency clusters, attenuated and reconstructed.<br><br>'
+            '<b>Parameter meanings</b><br>'
+            '- <i>Frequency limits</i>: select the wavelet range. GUI detection requires the upper limit to remain below 95% of Nyquist.<br>'
+            '- <i>Envelope threshold</i>: local cluster-envelope mean + multiplier × local SD. Increasing this multiplier preserves fewer frames unchanged; lowering it preserves more. It is not an event-SNR cutoff.<br>'
+            '- <i>Minimum attenuation factor</i>: fraction retained below threshold; 1 preserves the coefficients. Graded attenuation varies between this floor and 1.<br>'
+            '- <i>Moving cycles</i>: threshold window = cycles / highest frequency in the cluster, with a five-sample minimum.<br>'
+            '- <i>Event refinement</i>: proposes events using absolute cluster-trace amplitude / MAD, then attenuates windows below a robust PC1-score cutoff. A low PC1 score does not prove an event is noise.<br><br>'
+            '<b>Reading the preview</b><br>'
+            'Compare the same events before and after denoising, including burst spikes and broad CS shoulders. The attenuation plot shows where coefficients were reduced. Frequency-bin count, PCA, clustering and sampled timepoints can all change the reconstructed signal; they are not merely display or speed controls.'
         )
         QMessageBox.information(self, 'Denoising Tips', tips)
 
@@ -6918,6 +6937,7 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
             return
         cfg = self._cfg_from_controls()
         m = self.parent_win.params
+        m['DENOISE_SHOW_ADVANCED'] = bool(self.chk_show_advanced.isChecked())
         m['DENOISE_PREVIEW_WINDOW_MS'] = float(self.spin_preview_window.value())
         m['DENOISE_F_MIN_HZ'] = float(cfg['f_min_hz'])
         m['DENOISE_F_MAX_HZ'] = float(cfg['f_max_hz'])

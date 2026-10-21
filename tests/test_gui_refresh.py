@@ -79,23 +79,23 @@ class GuiRefreshTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_main_polarity_buttons_load_reset_and_batch_share_one_setting(self):
-        self.assertTrue(self.win.btn_polarity_negative.isChecked())
-        self.win.btn_polarity_positive.click()
+        self.assertEqual(self.win.tabs_polarity.currentIndex(), 1)
+        self.win.tabs_polarity.setCurrentIndex(0)
         self.assertFalse(self.win.params['NEGATIVE_GOING'])
-        self.assertFalse(self.win.btn_polarity_negative.isChecked())
+        self.assertEqual(self.win.tabs_polarity.currentIndex(), 0)
         advanced=SettingsDialog(self.win)
         self.assertFalse(hasattr(advanced,'chk_negative'))
         advanced.close()
-        self.win.btn_polarity_negative.click()
+        self.win.tabs_polarity.setCurrentIndex(1)
         self.assertTrue(self.win.params['NEGATIVE_GOING'])
-        self.win.btn_polarity_positive.click()
+        self.win.tabs_polarity.setCurrentIndex(0)
         snapshot=self.win._current_settings_snapshot()
         cfg=self.root/'settings.json';cfg.write_text(json.dumps(snapshot))
-        self.win.btn_polarity_negative.click()
+        self.win.tabs_polarity.setCurrentIndex(1)
         with (patch('spike_detector.gui.QFileDialog.getOpenFileName',return_value=(str(cfg),'')),
               patch('spike_detector.gui.QMessageBox.information')):
             self.win.load_all_settings()
-        self.assertTrue(self.win.btn_polarity_positive.isChecked())
+        self.assertEqual(self.win.tabs_polarity.currentIndex(), 0)
         self.win.spin_cs_thresh.setValue(0)
         self.win.load_batch_folders([str(self.root)])
         self.assertEqual(self.win.run_detection_all(),(1,1))
@@ -104,7 +104,7 @@ class GuiRefreshTests(unittest.TestCase):
         self.assertTrue(np.any(abs(res['ss_peaks']-600)<=2))
         with patch('spike_detector.gui.QMessageBox.question',return_value=QtWidgets.QMessageBox.StandardButton.Yes):
             self.win.reset_app()
-        self.assertTrue(self.win.btn_polarity_negative.isChecked())
+        self.assertEqual(self.win.tabs_polarity.currentIndex(), 1)
 
     def test_threshold_group_cutoffs_keep_highpass_lowpass_parameter_mapping(self):
         for kind in ('CS','SS'):

@@ -582,7 +582,7 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
                         pre_detrended_cs=None, pre_detrended_ss=None,
                         initial_blank_ms=0.0, cs_order=3, ss_order=3,
                         local_baseline=False, local_baseline_cs_ms=200.0, local_baseline_ss_ms=50.0,
-                        ss_mask_pre_ms=None, ss_mask_post_ms=None):
+                        ss_mask_pre_ms=None, ss_mask_post_ms=None, cs_keep_indices=None):
     for value in (cs_thresh_sigma, ss_thresh_sigma):
         if not np.isfinite(value) or value < 0:
             raise ValueError('Threshold cutoffs must be finite and nonnegative; 0 disables that type.')
@@ -597,6 +597,8 @@ def process_cell_simple(raw_trace, fs, negative_going=True,
     cs_peaks = (_select_peaks(cs, cs_threshold, max(1, int(np.ceil(cs_min_dist_ms*fs/1000))), cs_mask)
                 if cs_thresh_sigma > 0 else np.array([], dtype=int))
     cs_peaks, cs_widths = _cs_width_filter(cs, cs_peaks, fs, cs_min_fwhm_ms)
+    if cs_keep_indices is not None:
+        cs_peaks = cs_peaks[np.isin(cs_peaks, cs_keep_indices)]
     pre = ss_blank_ms/2 if ss_mask_pre_ms is None else ss_mask_pre_ms
     post = ss_blank_ms/2 if ss_mask_post_ms is None else ss_mask_post_ms
     ss_mask = exclusion_mask(len(ss), fs, cs_peaks, pre, post, initial_blank_ms)
@@ -639,14 +641,14 @@ def process_cell_template_matching(raw_trace, fs,
                                    cs_selected_groups=None, ss_selected_groups=None,
                                    cs_min_filtered_peak_sigma=3.0,
                                    ss_mask_reference_cs=None,
-                                   template_whitening=False, fixed_whitening=None):
+                                   template_whitening=False, fixed_whitening=None, cs_keep_indices=None):
     if template_match_method not in ('LLR Probability Vector', 'Normalized Similarity', 'Burst-aware LLR'):
         raise ValueError('Unsupported template match method.')
     for val in (cs_similarity_threshold, ss_similarity_threshold):
         if not np.isfinite(val) or not 0 < val <= 1:
             raise ValueError('Similarity thresholds must be between 0 and 1.')
-    if not np.isfinite(similarity_min_response_sigma) or similarity_min_response_sigma <= 0:
-        raise ValueError('Minimum similarity response must be positive.')
+    if not np.isfinite(similarity_min_response_sigma) or similarity_min_response_sigma < 0:
+        raise ValueError('Minimum similarity response must be nonnegative; 0 disables it.')
     if not np.isfinite(cs_min_filtered_peak_sigma) or cs_min_filtered_peak_sigma < 0:
         raise ValueError('Minimum CS filtered-trace peak must be finite and nonnegative.')
     if not np.isfinite(template_ss_lowpass_hz) or template_ss_lowpass_hz < 0:
@@ -750,7 +752,7 @@ def process_cell_template_matching(raw_trace, fs,
                 noise_mask = safe_mask
         noise_sigma = _masked_sigma(trace, noise_mask)
         whitening_info[kind]['score_noise_mad'] = float(noise_sigma) if np.isfinite(noise_sigma) else None
-        response_floor = max(similarity_min_response_sigma, 3.0 if not short_core else 0.0) * noise_sigma
+        response_floor = max(similarity_min_response_sigma, 3.0 if not short_core and similarity_min_response_sigma > 0 else 0.0) * noise_sigma
         for bk, br in banks:
             if template_match_method == 'Normalized Similarity':
                 score, response, _ = _similarity_score(trace, bk, br, sim_fs, short_core, whitening)
@@ -795,6 +797,8 @@ def process_cell_template_matching(raw_trace, fs,
         cs_selected_groups, mask_is_safe=fixed_masks is not None)
     cs_peaks = np.unique(np.clip(np.rint(cs_candidates*fs/sim_fs).astype(int), 0, len(cs)-1))
     cs_peaks, cs_widths = _cs_width_filter(cs, cs_peaks, fs, cs_min_fwhm_ms, align_ms=2.0)
+    if cs_keep_indices is not None:
+        cs_peaks = cs_peaks[np.isin(cs_peaks, cs_keep_indices)]
     pre = ss_blank_ms/2 if ss_mask_pre_ms is None else ss_mask_pre_ms
     post = ss_blank_ms/2 if ss_mask_post_ms is None else ss_mask_post_ms
     mask_cs_peaks = cs_peaks if ss_mask_reference_cs is None else np.unique(
@@ -934,11 +938,23 @@ def compute_event_snrs(res, spike_type='CS', fs=1000.0, window_ms=100, max_per_c
     Parameters kept for compatibility:
     - window_ms is unused by design (shared intervals are in EVENT_SNR_POLICY).
     - trace_override allows callers to enforce a unified waveform source trace.
+    - GUI QC metrics are frozen with their candidate masks and reused for that
+      same source and event set; a different override is measured afresh.
     - unavailable estimates are NaN, preserving the selected event order.
     """
     snr_list = []
     if res is None:
         return snr_list
+    stored = res.get('event_amplitude_snr_' + str(spike_type).lower())
+    if stored is not None:
+        peaks = np.asarray(res.get(str(spike_type).lower() + '_peaks', []), dtype=int)
+        values = np.asarray(stored, dtype=float)
+        indices = np.asarray(res.get('amplitude_snr_indices_' + str(spike_type).lower(), []), dtype=int)
+        same_source = trace_override is None or np.array_equal(
+            np.asarray(trace_override), np.asarray(res.get('stats_source_trace', [])), equal_nan=True)
+        if len(values) == len(peaks) and np.array_equal(indices, peaks) and same_source:
+            chosen = _select_event_bank(peaks, max_per_cell=max_per_cell)
+            return values[np.searchsorted(peaks, chosen)].tolist()
 
     def _ms_to_samples(ms):
         try:

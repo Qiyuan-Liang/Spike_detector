@@ -37,7 +37,6 @@ class BatchDetectionTests(unittest.TestCase):
                 trace -= (4+i) * np.exp(-.5*((self.time-peak)/.8)**2)
             pd.DataFrame({'time': self.time, f'Cell{i}': trace}).to_csv(folder/'session.csv', index=False)
         self.win = MainWindow()
-        self.win.params['SS_MAX_FWHM_FILTER_ENABLED'] = False
         self.win.spin_avg_frames.setValue(0)
 
     def tearDown(self):
@@ -47,31 +46,33 @@ class BatchDetectionTests(unittest.TestCase):
     def test_ss_width_default_and_explicit_override(self):
         self.assertEqual(self.win.params['SS_MAX_FWHM_MS'], 4.5)
         dialog = SettingsDialog(self.win)
-        self.assertEqual(dialog.spin_ss_max_fwhm.value(), 4.5)
-        dialog.spin_ss_max_fwhm.setValue(3.0)
-        dialog.save_and_close()
+        self.assertFalse(hasattr(dialog, 'spin_ss_max_fwhm'))
+        self.assertFalse(hasattr(dialog, 'spin_cs_min_fwhm'))
+        dialog.close()
+        self.assertEqual(self.win.qc_inputs['SS_MAX_FWHM_MS'].value(), 4.5)
+        self.win.qc_inputs['SS_MAX_FWHM_MS'].setValue(3.0)
         self.assertEqual(self.win._current_settings_snapshot()['params']['SS_MAX_FWHM_MS'], 3.0)
         with patch('spike_detector.gui.QMessageBox.question',
                    return_value=QtWidgets.QMessageBox.StandardButton.Yes):
             self.win.reset_app()
         self.assertEqual(self.win.params['SS_MAX_FWHM_MS'], 4.5)
 
-    def test_cs_filtered_peak_setting_applies_to_batch_and_viewer(self):
+    def test_shared_amplitude_qc_applies_to_batch_and_viewer(self):
         self.win.tabs_detection.setCurrentIndex(1)
-        self.assertEqual(self.win.spin_template_cs_peak.value(), 3.0)
-        self.assertIn('filtered-trace peak', self.win.lbl_template_cs_peak.text())
-        self.win.spin_template_cs_peak.setValue(0.0)
-        self.assertEqual(self.win._current_settings_snapshot()['params']['TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA'], 0.0)
+        self.assertFalse(hasattr(self.win, 'spin_template_cs_peak'))
+        self.assertFalse(hasattr(self.win, 'spin_template_min_response'))
+        self.win.qc_inputs['CS_MIN_AMPLITUDE_SNR'].setValue(7.0)
+        self.assertEqual(self.win._current_settings_snapshot()['params']['CS_MIN_AMPLITUDE_SNR'], 7.0)
         wave = np.exp(-.5 * ((np.arange(41) - 20) / 5.0) ** 2)
         self.win.template_store['cs_templates'] = [wave]
         self.win.template_store['fs_cs'] = [1000.0]
         self.win.load_batch_folders(map(str, self.folders))
         self.assertEqual(self.win.run_detection_all(), (2, 2))
         for data in self.win.loaded_sessions.values():
-            self.assertEqual(data['effective_settings']['cs_min_filtered_peak_sigma'], 0.0)
-            self.assertEqual(data['results'][0]['cs_min_filtered_peak_sigma_used'], 0.0)
+            self.assertEqual(data['effective_settings']['spike_qc']['CS_MIN_AMPLITUDE_SNR'], 7.0)
+            self.assertEqual(data['results'][0]['spike_qc']['limits']['CS_MIN_AMPLITUDE_SNR'], 7.0)
         viewer = DetectionViewerDialog(self.win.data, self.win)
-        self.assertIn('filtered peak rejected', viewer.lbl_candidate_info.text())
+        self.assertIn('amplitude SNR rejected', viewer.lbl_candidate_info.text())
         viewer.close()
 
     def test_discovery_duplicates_invalid_and_nonrecursive(self):

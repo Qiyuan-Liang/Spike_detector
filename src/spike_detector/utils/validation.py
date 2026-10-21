@@ -75,13 +75,8 @@ def effective_settings(params, baseline, frames, fs, n):
         val = float(params.get(key, 0.90 if 'CS_' in key else 0.80))
         if not np.isfinite(val) or not 0 < val <= 1:
             raise ValueError(f'{key} must be in (0, 1].')
-    val = float(params.get('TEMPLATE_MIN_RESPONSE_SIGMA', 2.2))
-    if not np.isfinite(val) or val <= 0:
-        raise ValueError('TEMPLATE_MIN_RESPONSE_SIGMA must be positive.')
-    cs_peak = float(params.get('TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA', 3.0))
-    if not np.isfinite(cs_peak) or cs_peak < 0:
-        raise ValueError('TEMPLATE_CS_MIN_FILTERED_PEAK_SIGMA must be finite and nonnegative.')
-    out['cs_min_filtered_peak_sigma'] = cs_peak
+    from .qc import validate_qc
+    out['spike_qc'] = validate_qc(params)
     group_count = params.get('TEMPLATE_PARALLEL_GROUPS', 3)
     components = params.get('TEMPLATE_PARALLEL_COMPONENTS', 2)
     for name, value in (('TEMPLATE_PARALLEL_GROUPS', group_count),
@@ -122,8 +117,6 @@ def effective_settings(params, baseline, frames, fs, n):
                      ('SS max FWHM', params.get('SS_MAX_FWHM_MS', 4.5))]:
         if not np.isfinite(val) or val < 0:
             raise ValueError(f'{key} must be finite and nonnegative.')
-    if params.get('SS_MAX_FWHM_FILTER_ENABLED', True) and params.get('SS_MAX_FWHM_MS', 4.5) <= 0:
-        raise ValueError('Enabled SS maximum width must be positive.')
     if not np.isfinite(frames) or int(frames) != frames or frames < 0 or frames > n:
         raise ValueError('Frame averaging must be an integer between zero and the recording length.')
     method = baseline.get('method', 'Median')

@@ -179,7 +179,7 @@ class LifecycleGuiTests(unittest.TestCase):
         pd.DataFrame({'time_ms': self.time, 'cell': self.trace}).to_csv(self.input, index=False)
         self.win = MainWindow()
         self.win.params['NEGATIVE_GOING'] = False
-        self.win.params['SS_MAX_FWHM_FILTER_ENABLED'] = False
+        self.win.qc_inputs['SS_MAX_FWHM_MS'].setValue(0)
         self.win.spin_avg_frames.setValue(0)
         self.win.master_folder = str(self.root)
         self.win.refresh_sessions()
@@ -189,7 +189,7 @@ class LifecycleGuiTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_default_temporary_first_run_and_close_cleanup(self):
-        self.assertEqual(self.win.chk_detection_save.text(), 'save')
+        self.assertEqual(self.win.chk_detection_save.text(), 'Save')
         self.assertFalse(self.win.chk_detection_save.isChecked())
         self.assertEqual(self.win.run_detection_all(), (1, 1))
         data = self.win.data

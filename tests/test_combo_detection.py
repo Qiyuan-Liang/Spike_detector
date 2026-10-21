@@ -66,6 +66,8 @@ class ComboTests(unittest.TestCase):
     def test_combo_whitens_final_pass_and_control_reuses_noise_fit(self):
         raw, fs, context = self.signal()
         context['params']['TEMPLATE_WHITENING'] = True
+        # Explicit amplitude QC replaces the former implicit CS height floor.
+        context['params']['CS_MIN_AMPLITUDE_SNR'] = 3.0
         result = _detect_cell(raw, fs, **context)
         for kind in ('cs', 'ss'):
             self.assertEqual(result['combo'][kind]['source'], 'auto')

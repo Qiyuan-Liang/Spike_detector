@@ -376,11 +376,13 @@ class ScienceGuiTests(unittest.TestCase):
         self.win.spin_template_groups.setValue(4)
         self.win.combo_template_method.setCurrentIndex(1)
         self.win.spin_template_cs_sigma.setValue(9)
-        self.win.spin_template_cs_peak.setValue(4)
+        self.win.qc_inputs['CS_MIN_AMPLITUDE_SNR'].setValue(4)
+        self.win.qc_inputs['CS_MAX_FWHM_MS'].setValue(45)
         self.win.spin_template_ss_sigma.setValue(7)
         self.win.spin_template_cs_sim.setValue(0.85)
         self.win.spin_template_ss_sim.setValue(0.75)
-        self.win.spin_template_min_response.setValue(3)
+        self.win.qc_inputs['SS_MIN_AMPLITUDE_SNR'].setValue(3)
+        self.win.qc_inputs['SS_MIN_FWHM_MS'].setValue(.4)
         self.win.spin_template_lowpass.setValue(650)
         self.win.chk_local_baseline.setChecked(True)
         self.win.spin_local_ss_ms.setValue(60)
@@ -399,15 +401,14 @@ class ScienceGuiTests(unittest.TestCase):
         self.win.tabs_detection.setCurrentIndex(1)
         self.win.chk_denoise.setChecked(True)
         advanced = SettingsDialog(self.win)
-        self.win.btn_polarity_positive.click()
+        self.win.tabs_polarity.setCurrentIndex(0)
         advanced.chk_denoise_cs.setChecked(True)
         advanced.spin_cs_mind.setValue(31)
-        advanced.spin_cs_min_fwhm.setValue(7)
+        self.win.qc_inputs['CS_MIN_FWHM_MS'].setValue(7)
         advanced.spin_ss_mind.setValue(5)
         advanced.spin_ss_mask_pre.setValue(7)
         advanced.spin_ss_mask_post.setValue(13)
-        advanced.chk_ss_max_fwhm.setChecked(False)
-        advanced.spin_ss_max_fwhm.setValue(5.5)
+        self.win.qc_inputs['SS_MAX_FWHM_MS'].setValue(5.5)
         advanced.spin_initial_blank.setValue(180)
         advanced.spin_tpl_cs_window.setValue(40)
         advanced.spin_tpl_ss_window.setValue(12)
@@ -453,12 +454,15 @@ class ScienceGuiTests(unittest.TestCase):
         })
         self.win.colors['cs_trace'] = '#123456'
         expected = self.win._current_settings_snapshot()
+        expected_qc = {key: widget.value() for key, widget in self.win.qc_inputs.items()}
         path = root / 'settings.json'
         with patch('spike_detector.gui.QFileDialog.getSaveFileName', return_value=(str(path), '')), \
              patch('spike_detector.gui.QMessageBox.information'):
             self.win.save_all_settings()
         self.assertEqual(json.loads(path.read_text()), expected)
 
+        for widget in self.win.qc_inputs.values():
+            widget.setValue(0)
         self.win.spin_cs_order.setValue(2)
         self.win.spin_ss_order.setValue(2)
         self.win.chk_template_parallel.setChecked(False)
@@ -483,6 +487,7 @@ class ScienceGuiTests(unittest.TestCase):
         failed.assert_not_called()
         loaded.assert_called_once()
         self.assertEqual(self.win._current_settings_snapshot(), expected)
+        self.assertEqual({key: widget.value() for key, widget in self.win.qc_inputs.items()}, expected_qc)
         self.assertEqual(len(self.win.template_store['cs_templates']), 1)
         self.assertEqual(len(self.win.template_store['ss_templates']), 1)
         advanced = SettingsDialog(self.win)

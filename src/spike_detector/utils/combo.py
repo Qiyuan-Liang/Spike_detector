@@ -64,9 +64,14 @@ def _learn_bank(trace, peaks, mask, fs, window_ms, *, max_width=None,
 
 def process_cell_combo(raw, fs, *, common, seed_options, template_options,
                        fallback_templates, cs_window_ms=30, ss_window_ms=8,
-                       ss_max_width=None):
+                       ss_max_width=None, qc_params=None, qc_source=None):
     template_options = dict(template_options)
-    seeds = process_cell_simple(raw, fs, **common, **seed_options)
+    if qc_params is None:
+        seeds = process_cell_simple(raw, fs, **common, **seed_options)
+    else:
+        from .qc import run_with_qc
+        seeds = run_with_qc(lambda **qc: process_cell_simple(raw, fs, **common, **seed_options, **qc),
+                            qc_source, fs, qc_params)
     cs = seeds['cs_trace']
     ss = seeds['ss_trace']
     lowpass = template_options.get('template_ss_lowpass_hz', 0)
@@ -96,9 +101,11 @@ def process_cell_combo(raw, fs, *, common, seed_options, template_options,
     # from CS contamination. Otherwise SS exclusions follow final detected CS.
     if not learned['cs_templates']:
         options['ss_mask_reference_cs'] = seeds['cs_peaks']
-    result = process_cell_template_matching(raw, fs, **common, **options,
+    def match(**qc):
+        return process_cell_template_matching(raw, fs, **common, **options, **qc,
         template_cs_bank=learned['cs_templates'], template_cs_fs_bank=learned['fs_cs'],
         template_ss_bank=learned['ss_templates'], template_ss_fs_bank=learned['fs_ss'])
+    result = match() if qc_params is None else run_with_qc(match, qc_source, fs, qc_params)
     result['det_method'] += ' + Combo'
     result['combo'] = dict(min_clean_seeds=3, seed_cs_cutoff=seed_options['cs_thresh_sigma'],
         seed_ss_cutoff=seed_options['ss_thresh_sigma'], cs=metadata['cs'], ss=metadata['ss'],
