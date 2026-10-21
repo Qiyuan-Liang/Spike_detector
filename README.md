@@ -145,13 +145,21 @@ In Detection Viewer, SS ticks and CS duration bars sit above the raw trace for p
 
 - **Save Settings** writes the current GUI configuration to a JSON file.
 - **Load Settings** restores parameters from a saved JSON file.
-- Detection result sidecars can also be loaded through **Load Settings** to reproduce a previous run.
+- Detection result sidecars can also be loaded through **Load Settings** to configure a new run; this does not load events.
+- **Load Session** opens a recording folder or its `spike_detection` subfolder and restores existing saved detections without rerunning detection. The Detection Viewer opens automatically and Spike Statistics works on those archived results.
+- **Reset App** is inside **Advanced Settings**, with confirmation.
 
 ## Inspection And Export
 
-The main window has native segmented **Positive-going** / **Negative-going** tabs below Cell. The tabs set the existing polarity parameter used by settings files, ordinary detection, Combo, and batch detection. The selector has no empty background panel. The duplicate Advanced Settings switch has been removed. Raw plots retain the recorded direction; the choice controls the sign used for detecting events.
+The main window has native segmented **Positive-going** / **Negative-going** tabs below the shared Session/Cell row. The tabs set the existing polarity parameter used by settings files, ordinary detection, Combo, and batch detection. The selector has no empty background panel. The duplicate Advanced Settings switch has been removed. Raw plots retain the recorded direction; the choice controls the sign used for detecting events.
 
 The Threshold tab groups **CS** and **SS** controls into two rows each: high-pass/low-pass cutoffs, then filter order/threshold. Filter cutoff `0` disables that cutoff (explained in hover help); threshold `0` still disables the corresponding spike type (or its Combo seeds). The controls keep the same saved parameter names and detection calculations. The upper panel follows the active tab’s height, with consistent spacing between rows and groups. **Parallel** and **Save**, like other GUI controls, start with capital letters.
+
+The left panel aligns baseline correction, baseline window and percentile controls. Frame processing and its frame count share one row. Spike QC uses compact **Min SNR**, **Min FWHM** and **Max FWHM** inputs. Threshold/amplitude-SNR and millisecond settings display one decimal; frequencies display integer Hz. Correlation and opacity controls keep their finer precision. The Denoise checkbox indicates whether denoising is enabled.
+
+**Load Session** uses the raw, frame-processed, baseline and filtered traces saved in each analyzed NPZ, together with accepted events, observation masks, event SNR and width reports. Changing Session in the main window or Detection Viewer restores that recording’s preprocessing/detection settings and data path. Statistics pool archived measurements and never form cross-recording ACG pairs. Edits prepare a new detection; they do not alter the displayed archived results. Explicitly running detection uses the edited controls and the normal Save/overwrite policy. Embedded run settings take precedence over a conflicting settings sidecar; old sub-decimal parameters are retained in metadata even when controls display rounded values. Missing external template files are reported, but stored event results remain viewable.
+
+New exports also preserve matching scores, local threshold vectors, candidate diagnostics and the GUI configuration. For older files lacking these vectors, the viewer explicitly labels the missing information and omits the corresponding cutoff lines rather than reconstructing scores or rerunning detection. Files missing the traces, masks or run settings required for reliable restoration are skipped with an explanation. The loader accepts permanent `*_analyzed.npz` results at the selected folder’s top level or in its `spike_detection` subfolder; it does not scan nested experiment folders or temporary viewing exports.
 
 Useful viewer tools:
 
