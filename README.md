@@ -149,7 +149,7 @@ In Detection Viewer, SS ticks and CS duration bars sit above the raw trace for p
 
 ## Inspection And Export
 
-The main window has native segmented **Positive-going** / **Negative-going** tabs below Cell. The tabs set the existing polarity parameter used by settings files, ordinary detection, Combo, and batch detection. The duplicate Advanced Settings switch has been removed. Raw plots retain the recorded direction; the choice controls the sign used for detecting events.
+The main window has native segmented **Positive-going** / **Negative-going** tabs below Cell. The tabs set the existing polarity parameter used by settings files, ordinary detection, Combo, and batch detection. The selector has no empty background panel. The duplicate Advanced Settings switch has been removed. Raw plots retain the recorded direction; the choice controls the sign used for detecting events.
 
 The Threshold tab groups **CS** and **SS** controls into two rows each: high-pass/low-pass cutoffs, then filter order/threshold. Filter cutoff `0` disables that cutoff (explained in hover help); threshold `0` still disables the corresponding spike type (or its Combo seeds). The controls keep the same saved parameter names and detection calculations. The upper panel follows the active tab’s height, with consistent spacing between rows and groups. **Parallel** and **Save**, like other GUI controls, start with capital letters.
 

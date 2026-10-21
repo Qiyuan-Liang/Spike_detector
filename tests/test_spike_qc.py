@@ -126,10 +126,11 @@ class SpikeQCGuiTests(unittest.TestCase):
         win = MainWindow()
         try:
             win.show(); self.app.processEvents()
-            self.assertIsInstance(win.tabs_polarity, QtWidgets.QTabWidget)
+            self.assertIsInstance(win.tabs_polarity, QtWidgets.QTabBar)
+            self.assertFalse(win.tabs_polarity.drawBase())
             self.assertEqual(win.tabs_polarity.styleSheet(), '')
-            self.assertFalse(win.tabs_polarity.tabBar().usesScrollButtons())
-            self.assertGreaterEqual(win.tabs_polarity.width(), win.tabs_polarity.tabBar().sizeHint().width())
+            self.assertFalse(win.tabs_polarity.usesScrollButtons())
+            self.assertGreaterEqual(win.tabs_polarity.width(), win.tabs_polarity.sizeHint().width())
             for tab in (0, 1):
                 win.tabs_detection.setCurrentIndex(tab); self.app.processEvents()
                 self.assertTrue(win.group_spike_qc.isVisible())
