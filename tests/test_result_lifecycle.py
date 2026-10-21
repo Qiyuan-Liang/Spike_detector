@@ -323,7 +323,8 @@ class LifecycleGuiTests(unittest.TestCase):
         renderer = self.win.canvas.get_renderer()
         self.assertIsNotNone(legend)
         self.assertGreater(legend.get_window_extent(renderer).y0, axis.get_window_extent(renderer).y1)
-        self.assertLess(legend.get_window_extent(renderer).y1, axis.title.get_window_extent(renderer).y0)
+        self.assertEqual(axis.get_title(), '')
+        self.assertLessEqual(legend.get_window_extent(renderer).y1, self.win.canvas.figure.bbox.y1)
 
 
 if __name__ == '__main__':

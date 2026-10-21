@@ -72,7 +72,7 @@ from .utils.combo import process_cell_combo
 from .utils.qc import QC_DEFAULTS, LEGACY_QC_KEYS, migrate_qc_settings, run_with_qc
 from .utils.results import TemporaryDetectionStore, cleanup_legacy_temporaries, output_paths, publish_detection
 
-APP_VERSION = '3.6.42'
+APP_VERSION = '3.6.43'
 
 
 # Keep input help in one place so the same setting reads consistently in the
@@ -4365,7 +4365,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     ax.axvspan(max(s_ms, start_time), min(e_ms, end_time), color=col, alpha=0.18, lw=0)
         except Exception:
             pass
-        ax.set_title(f"{data['cell_names'][idx]} Raw Trace", fontweight='bold', pad=32 if not any_vis_override else 6)
         ax.set_xlabel('Time (ms)')
         ax.set_ylabel('Signal')
         # tidy legend (no frame) unless user requested simplified black view

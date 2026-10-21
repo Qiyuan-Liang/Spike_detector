@@ -139,7 +139,7 @@ Each settings sidecar has the same structure as **Save Settings**, so it can rel
 
 In **Threshold** mode, set **CS threshold** or **SS threshold** to **0** to disable that spike type. The export retains both CS and SS fields, with empty event arrays for the disabled type. Both traces remain available for inspection. In **Combo**, zero disables seed collection for that type; a loaded template bank can still supply the final matching pass.
 
-In Detection Viewer, SS ticks and CS duration bars sit above the raw trace for positive-going indicators and below for negative-going indicators. A retained CS with uncertain FWHM still has a short green dash. The main raw-trace legend is placed above the plotting area.
+In Detection Viewer, SS ticks and CS duration bars sit above the raw trace for positive-going indicators and below for negative-going indicators. A retained CS with uncertain FWHM still has a short green dash. The main raw-trace preview has no title; its legend remains above the plotting area.
 
 ## Manual Settings
 
