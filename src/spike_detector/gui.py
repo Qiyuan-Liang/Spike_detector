@@ -74,7 +74,7 @@ from .utils.qc import QC_DEFAULTS, LEGACY_QC_KEYS, migrate_qc_settings, run_with
 from .utils.saved_session import load_saved_detection_folder, json_safe
 from .utils.results import TemporaryDetectionStore, cleanup_legacy_temporaries, output_paths, publish_detection
 
-APP_VERSION = '3.6.44'
+APP_VERSION = '3.6.45'
 
 
 # Keep input help in one place so the same setting reads consistently in the
@@ -87,7 +87,7 @@ SETTING_TOOLTIPS = {
     'combo_baseline_method': 'Choose how slow baseline drift is estimated before detection.',
     'spin_baseline_window': 'Requested window for median/percentile drift estimation. Its effective sample count is constrained by recording length and saved in result metadata.',
     'spin_baseline_percentile': 'Percentile used only for the Percentile baseline method.',
-    'combo_frame_processing': 'Choose rolling averaging, or block averaging interpolated back to the original time grid. Frame grouping reduces temporal resolution without changing stored sample times.',
+    'combo_frame_processing': 'Rolling average uses overlapping frame windows. Mean averages non-overlapping frame groups and interpolates them onto the original time grid; this is the former Downsampling frames mode. Both reduce temporal resolution.',
     'spin_avg_frames': 'Frames used for rolling or block averaging before detection. 0 disables processing; 1 leaves the trace unchanged. Larger groups smooth noise and fast spikes.',
     'spin_window': 'Time span displayed in the plot; this does not change detection.',
     'spin_zoom': 'Vertical plot range; 0 chooses the range automatically.',
@@ -1566,23 +1566,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # Folder/session controls (compact folded list using QComboBox)
         btn_folder = QtWidgets.QPushButton('Select Folder')
         btn_folder.clicked.connect(self.select_folder)
-        # place folder button on its own line
-        # session selector on its own line (between folder and cell selection)
         self.list_sessions = QtWidgets.QComboBox()
         self.list_sessions.setMinimumContentsLength(20)
         self.list_sessions.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         # connect later; use currentIndexChanged without argument handling
         self.list_sessions.currentIndexChanged.connect(self.on_session_select)
-        # cell selector inline
         self.combo_cell = QtWidgets.QComboBox()
         self.combo_cell.currentIndexChanged.connect(self.on_cell_change)
         self.tabs_polarity = QtWidgets.QTabBar()
         self.tabs_polarity.addTab('Positive-going')
         self.tabs_polarity.addTab('Negative-going')
-        self.tabs_polarity.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum,
+        self.tabs_polarity.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                         QtWidgets.QSizePolicy.Policy.Fixed)
         self.tabs_polarity.setDrawBase(False)
-        self.tabs_polarity.setExpanding(False)
+        self.tabs_polarity.setExpanding(True)
         self.tabs_polarity.setUsesScrollButtons(False)
         self.tabs_polarity.setElideMode(Qt.TextElideMode.ElideNone)
         self.tabs_polarity.setMinimumWidth(self.tabs_polarity.sizeHint().width())
@@ -1590,8 +1587,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs_polarity.setToolTip('Spike direction, shared by threshold, template, Combo and batch detection. Raw traces retain recorded polarity.')
         self._sync_polarity_buttons()
         self.tabs_polarity.currentChanged.connect(lambda index: self.on_polarity_changed(index == 1))
-        # keep compact, add to upper layout later
-        # upper_layout.addLayout(vbox_left)
 
         # Baseline correction controls
 
@@ -1612,8 +1607,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Note: baseline / filter visualization checkboxes are placed
         # in the full-width control row below the separator (see controls_h)
         self.combo_frame_processing = QtWidgets.QComboBox()
-        self.combo_frame_processing.addItems(['Rolling average', 'Downsampling frames'])
-        self.combo_frame_processing.setCurrentText(str(self.params.get('FRAME_PROCESSING_MODE', 'Rolling average')))
+        self.combo_frame_processing.addItem('Rolling average', 'Rolling average')
+        self.combo_frame_processing.addItem('Mean', 'Downsampling frames')
+        self._set_frame_processing_mode(self.params.get('FRAME_PROCESSING_MODE', 'Rolling average'))
         self.combo_frame_processing.currentTextChanged.connect(self.on_frame_processing_mode_changed)
         # Averaging (frames) applied to visualization and detection
         self.spin_avg_frames = QtWidgets.QSpinBox(); self.spin_avg_frames.setRange(0, 500); self.spin_avg_frames.setValue(0)
@@ -1623,8 +1619,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_denoise.stateChanged.connect(self.on_denoise_toggle)
         self.btn_denoise_settings = QtWidgets.QPushButton('Denoise settings')
         self.btn_denoise_settings.clicked.connect(self.open_denoising_settings)
-        # put baseline controls into middle column
-        # upper_layout.addLayout(vbox_mid)
         left_grid = QtWidgets.QGridLayout()
         left_grid.setContentsMargins(0, 0, 0, 0)
         left_grid.setHorizontalSpacing(10)
@@ -1632,33 +1626,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_settings_grid = left_grid
         self.btn_select_folder = btn_folder
         left_grid.addWidget(btn_folder, 0, 0, 1, 2)
-        selection = QtWidgets.QHBoxLayout()
-        selection.setSpacing(6)
-        selection.addWidget(QtWidgets.QLabel('Session:'))
         self.list_sessions.setMinimumContentsLength(10)
-        self.list_sessions.setMinimumWidth(85)
-        selection.addWidget(self.list_sessions, 3)
-        selection.addSpacing(6)
-        selection.addWidget(QtWidgets.QLabel('Cell:'))
-        self.combo_cell.setMinimumContentsLength(5)
+        self.combo_cell.setMinimumContentsLength(10)
         self.combo_cell.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        selection.addWidget(self.combo_cell, 2)
-        left_grid.addLayout(selection, 1, 0, 1, 2)
-        left_grid.addWidget(self.tabs_polarity, 2, 0, 1, 2, Qt.AlignmentFlag.AlignRight)
-        for row, label, widget in ((3, 'Baseline correction:', self.combo_baseline_method),
-                (4, 'Baseline window:', self.spin_baseline_window),
-                (5, 'Percentile:', self.spin_baseline_percentile)):
+        for row, label, widget in ((1, 'Session:', self.list_sessions),
+                (2, 'Cell:', self.combo_cell),
+                (4, 'Baseline correction:', self.combo_baseline_method),
+                (5, 'Baseline window:', self.spin_baseline_window),
+                (6, 'Percentile:', self.spin_baseline_percentile)):
             left_grid.addWidget(QtWidgets.QLabel(label), row, 0)
             left_grid.addWidget(widget, row, 1)
+        left_grid.addWidget(self.tabs_polarity, 3, 0, 1, 2)
         frame_row = QtWidgets.QHBoxLayout()
         frame_row.setSpacing(6)
         frame_row.addWidget(self.combo_frame_processing, 1)
         self.spin_avg_frames.setFixedWidth(58)
         frame_row.addWidget(self.spin_avg_frames)
-        left_grid.addWidget(QtWidgets.QLabel('Frame processing:'), 6, 0)
-        left_grid.addLayout(frame_row, 6, 1)
-        left_grid.addWidget(self.chk_denoise, 7, 0)
-        left_grid.addWidget(self.btn_denoise_settings, 7, 1)
+        left_grid.addWidget(QtWidgets.QLabel('Frame processing:'), 7, 0)
+        left_grid.addLayout(frame_row, 7, 1)
+        left_grid.addWidget(self.chk_denoise, 8, 0)
+        left_grid.addWidget(self.btn_denoise_settings, 8, 1)
         left_grid.setColumnStretch(1, 1)
         # Raw trace visualization controls (grouped)
         vbox_right = QtWidgets.QVBoxLayout()
@@ -1755,7 +1742,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vbox_right.addWidget(self.text_stats)
         # upper_layout.addLayout(vbox_right)
 
-        # --- Now compose upper panel with 3 equal columns ---
+        # The preprocessing panel keeps its natural width; detection and Info share extra space.
         upper_panel = QtWidgets.QWidget()
         upper_h = QtWidgets.QHBoxLayout()
         upper_h.setSpacing(4)
@@ -2055,8 +2042,13 @@ class MainWindow(QtWidgets.QMainWindow):
         col3.addWidget(QtWidgets.QLabel('Info:'))
         col3.addWidget(self.text_stats)
 
-        # place columns into a layout wrapper to ensure equal stretch
-        upper_h.addLayout(col1, 1); upper_h.addLayout(col2, 1); upper_h.addLayout(col3, 1)
+        # Keep the left panel compact and let the other columns absorb extra width.
+        self.left_settings_panel = QtWidgets.QWidget()
+        self.left_settings_panel.setLayout(col1)
+        self.left_settings_panel.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Maximum)
+        upper_h.addWidget(self.left_settings_panel, 0, ALIGN_TOP)
+        upper_h.addLayout(col2, 4)
+        upper_h.addLayout(col3, 3)
         upper_panel.setLayout(upper_h)
         upper_panel.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Maximum)
         self.upper_panel = upper_panel
@@ -2686,14 +2678,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_frame_processing_mode_changed(self):
         try:
-            self.params['FRAME_PROCESSING_MODE'] = str(self.combo_frame_processing.currentText())
+            self.params['FRAME_PROCESSING_MODE'] = self._get_frame_processing_mode()
         except Exception:
             pass
         self.update_plot()
 
+    def _set_frame_processing_mode(self, mode):
+        # Keep the historical stored value so old settings and archived runs agree.
+        mode = 'Downsampling frames' if str(mode).casefold() == 'mean' else str(mode)
+        self.combo_frame_processing.setCurrentIndex(max(0, self.combo_frame_processing.findData(mode)))
+
     def _get_frame_processing_mode(self):
         try:
-            return str(self.combo_frame_processing.currentText())
+            return str(self.combo_frame_processing.currentData())
         except Exception:
             return str(self.params.get('FRAME_PROCESSING_MODE', 'Rolling average'))
 
@@ -3037,7 +3034,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.spin_ss_thresh.setValue(float(settings_params.get('SS_THRESHOLD_SIGMA', self.spin_ss_thresh.value())))
                 self.spin_ss_order.setValue(int(settings_params.get('SS_FILTER_ORDER', self.spin_ss_order.value())))
                 self.spin_ss_blank.setValue(float(settings_params.get('SS_BLANK_MS', self.spin_ss_blank.value())))
-                self.combo_frame_processing.setCurrentText(str(settings_params.get('FRAME_PROCESSING_MODE', self.combo_frame_processing.currentText())))
+                self._set_frame_processing_mode(settings_params.get('FRAME_PROCESSING_MODE', self._get_frame_processing_mode()))
                 self.combo_template_method.setCurrentIndex(max(0, self.combo_template_method.findData(
                     str(settings_params.get('TEMPLATE_MATCH_METHOD', 'LLR Probability Vector')))))
                 self.chk_template_parallel.setChecked(bool(settings_params.get('TEMPLATE_PARALLEL', False)))
@@ -4144,7 +4141,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.spin_ss_high.setValue(self.params['SS_HIGH_CUT_HZ'])
                 self.spin_ss_thresh.setValue(self.params['SS_THRESHOLD_SIGMA'])
                 self.spin_ss_blank.setValue(self.params['SS_BLANK_MS'])
-                self.combo_frame_processing.setCurrentText(self.params['FRAME_PROCESSING_MODE'])
+                self._set_frame_processing_mode(self.params['FRAME_PROCESSING_MODE'])
                 self.combo_template_method.setCurrentIndex(max(0, self.combo_template_method.findData(
                     self.params['TEMPLATE_MATCH_METHOD'])))
                 if hasattr(self, 'chk_template_parallel') and self.chk_template_parallel is not None:
