@@ -71,10 +71,12 @@ from .utils.validation import validate_session, effective_settings, mask_windows
 from .utils.widths import measure_width, measure_widths
 from .utils.combo import process_cell_combo
 from .utils.qc import QC_DEFAULTS, LEGACY_QC_KEYS, migrate_qc_settings, run_with_qc
-from .utils.saved_session import load_saved_detection_folder, json_safe
+from .utils.annotations import manual_result
+from .utils.boundaries import observation_bounds, observation_mask, protected_preprocess, protected_filter, embed_observed_result, smooth_blanked_display, visualization_window
+from .utils.saved_session import load_saved_detection_folder, load_saved_detection, json_safe
 from .utils.results import TemporaryDetectionStore, cleanup_legacy_temporaries, output_paths, publish_detection
 
-APP_VERSION = '3.6.45'
+APP_VERSION = '3.6.47'
 
 
 # Keep input help in one place so the same setting reads consistently in the
@@ -91,7 +93,7 @@ SETTING_TOOLTIPS = {
     'spin_avg_frames': 'Frames used for rolling or block averaging before detection. 0 disables processing; 1 leaves the trace unchanged. Larger groups smooth noise and fast spikes.',
     'spin_window': 'Time span displayed in the plot; this does not change detection.',
     'spin_zoom': 'Vertical plot range; 0 chooses the range automatically.',
-    'slider_time': 'Move the visible time window through the recording.',
+    'slider_time': 'Move the visible time window through the full recording, including blanked periods. New views start at the initial blank boundary.',
     'spin_cs_low': 'CS high-pass cutoff in Hz; 0 disables this cutoff.',
     'spin_cs_high': 'CS low-pass cutoff in Hz; 0 disables this cutoff.',
     'spin_cs_thresh': 'CS peak cutoff in MAD noise units; 0 disables CS in Threshold mode. With Combo, this selects template-learning seeds; use a conservative value.',
@@ -121,7 +123,7 @@ SETTING_TOOLTIPS = {
     'chk_detection_save': 'Save permanent results beside recordings. Unchecked: temporary viewing exports, removed on close. Existing saved results require confirmation before replacement.',
     'paths': 'Enter one recording-folder path per line for batch detection.',
     'combo_scope': 'Choose whether templates come from this cell or all cells.',
-    'combo_type': 'Choose whether the selected waveforms become CS or SS templates.',
+    'combo_type': 'Select CS templates, SS templates, or manual spike labels. Selections belong to their original cell and session.',
     'spin_cs_w': 'Duration of the extracted CS template waveform.',
     'spin_ss_w': 'Duration of the extracted SS template waveform.',
     'spin_cs_bg_alpha': 'Opacity of individual CS waveforms behind their mean.',
@@ -135,7 +137,8 @@ SETTING_TOOLTIPS = {
     'spin_ss_mind': 'Minimum SS candidate spacing before QC. Applied once across template groups; 0 disables extra spacing beyond the native sample grid.',
     'spin_ss_mask_pre': 'Exclude SS this long before accepted CS; 0 removes this side. Template/FIR support can extend the actual masked region.',
     'spin_ss_mask_post': 'Exclude SS this long after accepted CS; 0 removes this side. Template/FIR support can extend the actual masked region.',
-    'spin_initial_blank': 'Ignore this duration at recording start; 0 disables this exclusion. Template support still masks incomplete boundary windows.',
+    'spin_final_blank': 'Exclude the end of the recording from preprocessing, detection and analysis. 0 disables. Exports retain the raw samples for viewing and an explicit valid interval for analysis.',
+    'spin_initial_blank': 'Exclude the recording start from preprocessing, detection and analysis; 0 disables. Template support also excludes incomplete boundary windows.',
     'spin_tpl_cs_window': 'Duration of CS waveforms saved as templates.',
     'spin_tpl_ss_window': 'Duration of SS waveforms saved as templates.',
     'spin_template_components': 'PCA components used to group templates, not detection kernels.',
@@ -175,7 +178,7 @@ def _apply_numeric_precision(owner):
     sigma = {'spin_cs_thresh', 'spin_ss_thresh', 'spin_template_cs_sigma',
              'spin_template_ss_sigma', 'spin_thr_sigma', 'spin_evt_sigma', 'spin_evt_z'}
     ms = {'spin_baseline_window', 'spin_window', 'spin_preview_window', 'spin_cs_mind',
-          'spin_ss_mind', 'spin_ss_blank', 'spin_initial_blank', 'spin_tpl_cs_window',
+          'spin_ss_mind', 'spin_ss_blank', 'spin_initial_blank', 'spin_final_blank', 'spin_tpl_cs_window',
           'spin_tpl_ss_window', 'spin_cs_w', 'spin_ss_w', 'spin_evt_win',
           'spin_ss_mask_pre', 'spin_ss_mask_post'}
     for name, widget in vars(owner).items():
@@ -201,17 +204,24 @@ def _apply_setting_tooltips(owner):
 
 def _detect_cell(raw, fs, params, baseline_params, frames, frame_mode, templates, denoise_cfg,
                  fixed_exclusion_masks=None, fixed_whitening=None):
+    start, stop = observation_bounds(len(raw), fs, params.get('INITIAL_BLANK_MS', 150.0),
+                                      params.get('FINAL_BLANK_MS', 50.0))
+    minimum = 6*max(int(params.get('CS_FILTER_ORDER', 4)), int(params.get('SS_FILTER_ORDER', 4)))+4
+    if stop-start < minimum or frames > stop-start:
+        raise ValueError(f'Boundary blanks leave {stop-start} samples; at least {minimum} observed samples (and at least the frame count) are required for these filters. Reduce the blanks/frame count or use a longer recording.')
+    local = dict(params, INITIAL_BLANK_MS=0.0, FINAL_BLANK_MS=0.0)
+    masks = ({key: np.asarray(value)[start:stop] for key, value in fixed_exclusion_masks.items()}
+             if fixed_exclusion_masks is not None else None)
+    result = _detect_observed_cell(np.asarray(raw)[start:stop], fs, local, baseline_params,
+        frames, frame_mode, templates, denoise_cfg, fixed_exclusion_masks=masks,
+        fixed_whitening=fixed_whitening)
+    return embed_observed_result(result, len(raw), start, stop)
+
+
+def _detect_observed_cell(raw, fs, params, baseline_params, frames, frame_mode, templates, denoise_cfg,
+                 fixed_exclusion_masks=None, fixed_whitening=None):
     """CPU-only detection job. No QWidget or mutable GUI state is used here."""
-    raw_proc = apply_frame_processing(raw, frames=frames, mode=frame_mode)
-    window_samples = int(baseline_params['window_ms'] * fs / 1000.0)
-    window_samples = max(5, min(window_samples, max(5, min(len(raw_proc)//2, 5000))))
-    if baseline_params['method'] == 'Percentile':
-        baseline = percentile_filter(raw_proc, baseline_params['percentile'], size=window_samples)
-    elif baseline_params['method'] == 'Median':
-        from scipy.ndimage import median_filter
-        baseline = median_filter(raw_proc, size=window_samples)
-    else:
-        baseline = np.zeros_like(raw_proc)
+    raw_proc, baseline, _ = protected_preprocess(raw, fs, params, baseline_params, frames, frame_mode)
     corrected = raw_proc - baseline
     denoise_meta = {'ok': False, 'error': 'disabled'}
     ss_input = cs_input = corrected
@@ -1418,6 +1428,22 @@ def _application_icon():
     return QtGui.QIcon(str(Path(__file__).parent / 'assets' / filename))
 
 
+def _display_processed_raw(data, cell_idx):
+    snapshot = data.get('_saved_settings_snapshot', {})
+    ui = snapshot.get('ui', {})
+    raw = np.asarray(data['raw_data'][:, cell_idx], dtype=float)
+    valid = data.get('analysis_valid_mask', np.ones(len(raw), dtype=bool))
+    return smooth_blanked_display(raw, data['processed_raw_data'][:, cell_idx], valid,
+        int(ui.get('avg_frames', 0)), snapshot.get('params', {}).get('FRAME_PROCESSING_MODE', 'Rolling average'))
+
+
+def _trace_view_window(data, params, width, slider, auto_start):
+    valid = data.get('analysis_valid_mask')
+    if valid is None:
+        valid = observation_mask(len(data['time_ms']), float(data['fs']), params)
+    return visualization_window(data['time_ms'], width, slider/1000.0, valid, auto_start)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     detection_completed = QtCore.pyqtSignal(int, int)
 
@@ -1474,6 +1500,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'SS_BLANK_MS': 18.0,
             'SS_MAX_FWHM_MS': 4.5,
             'INITIAL_BLANK_MS': 150.0,
+                'FINAL_BLANK_MS': 50.0,
             'CS_FILTER_ORDER': 4,
             'SS_FILTER_ORDER': 4,
             'FRAME_PROCESSING_MODE': 'Rolling average',
@@ -1516,11 +1543,13 @@ class MainWindow(QtWidgets.QMainWindow):
             'RAW_SCALE_BAR_UNIT': 'Sigma',
             'STATS_CS_BG_ALPHA': 0.3,
             'STATS_SS_BG_ALPHA': 0.003,
-            'DETECTION_VIEW_WINDOW_MS': 500.0,
+            'DETECTION_VIEW_WINDOW_MS': 1000.0,
             'DETECTION_VIEW_Y_RANGE': 0.0,
-            'DETECTION_VIEW_CENTER': 200,
+            'DETECTION_VIEW_CENTER': 0,
+            'DETECTION_VIEW_AUTO_START': True,
             'SLIDER_VIEW_Y_RANGE': 0.0,
-            'SLIDER_VIEW_CENTER': 200,
+            'SLIDER_VIEW_CENTER': 0,
+            'SLIDER_VIEW_AUTO_START': True,
             'DENOISE_SHOW_ADVANCED': False,
             }
         _set_user_linewidth_scale(self.params.get('LINE_WIDTH_SCALE', 0.7))
@@ -1537,6 +1566,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Interactive selection state on main plot
         self.template_selection_active = False
+        self._template_records = []
+        self._label_drafts = {}
         self.template_selection_type = 'CS'
         self.template_selection_window_ms = 30.0
         self.template_selected_segments = {'CS': [], 'SS': []}
@@ -1547,6 +1578,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Currently loaded data (for single-session views)
         self.data = None
 
+        self._main_view_auto_start = True
         self._build_ui()
         self.detection_progress = QtWidgets.QProgressBar(self)
         self.detection_progress.setFixedWidth(230)
@@ -1658,7 +1690,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider_time.setMaximum(1000)
         self.slider_time.setValue(0)
         self.slider_time.valueChanged.connect(self.on_slider_time_changed)
-        self.spin_window = QtWidgets.QDoubleSpinBox(); self.spin_window.setRange(1.0, 1e6); self.spin_window.setValue(500.0)
+        self.spin_window = QtWidgets.QDoubleSpinBox(); self.spin_window.setRange(1.0, 1e6); self.spin_window.setValue(1000.0)
         self.spin_window.setSuffix(' ms')
         self.spin_window.valueChanged.connect(self.on_window_changed)
         # Note: time/window/Y-range controls are placed in a dedicated full-width
@@ -2100,8 +2132,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # CS/SS filter checkboxes (mutually exclusive)
         controls_h.addWidget(self.chk_show_cs)
         controls_h.addWidget(self.chk_show_ss)
-        self.btn_select_templates = QtWidgets.QPushButton('Select templates')
+        self.btn_select_templates = QtWidgets.QPushButton('Select As')
         self.btn_select_templates.clicked.connect(self.toggle_template_selection_or_save)
+        self.btn_select_templates.setToolTip('Select CS/SS template windows or manually label spikes across cells and sessions. Left click adds; right click removes. In label mode, Control + left click adds CS.')
         controls_h.addWidget(self.btn_select_templates)
         self.btn_abort_templates = QtWidgets.QPushButton('Abort')
         self.btn_abort_templates.clicked.connect(self.abort_template_selection)
@@ -2335,19 +2368,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_template_status_label()
 
     def _get_current_window_mask(self, t):
-        t_min, t_max = t[0], t[-1]
-        center_pct = float(self.slider_time.value()) / 1000.0 if hasattr(self, 'slider_time') else 0.0
-        total_ms = t_max - t_min
-        center_time = t_min + center_pct * total_ms
-        window_ms = float(self.spin_window.value()) if hasattr(self, 'spin_window') else 500.0
-        start_time = center_time - window_ms / 2.0
-        end_time = center_time + window_ms / 2.0
-        if start_time < t_min:
-            start_time = t_min
-            end_time = min(t_min + window_ms, t_max)
-        if end_time > t_max:
-            end_time = t_max
-            start_time = max(t_min, t_max - window_ms)
+        data = self.loaded_sessions[self.selected_session]
+        params = data.get('_saved_detection_params', self.params)
+        start_time, end_time = _trace_view_window(data, params, float(self.spin_window.value()),
+            self.slider_time.value(), self._main_view_auto_start)
         return (t >= start_time) & (t <= end_time)
 
     def _get_current_display_signal_full(self):
@@ -2361,11 +2385,10 @@ class MainWindow(QtWidgets.QMainWindow):
         frames = int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0
         saved_view = bool(data.get('loaded_detection_result'))
         if saved_view:
-            raw_proc = np.asarray(data['processed_raw_data'][:, idx])
+            raw_proc = _display_processed_raw(data, idx)
             baseline = np.asarray(data['baseline_traces'][:, idx])
         else:
-            raw_proc = apply_frame_processing(raw, frames=frames, mode=self._get_frame_processing_mode())
-            baseline = self.compute_baseline(raw_proc, fs)
+            raw_proc, baseline, _ = protected_preprocess(raw, fs, self.params, self.baseline_params, frames, self._get_frame_processing_mode())
         method = (data['_saved_settings_snapshot']['baseline_params'].get('method', '')
                   if saved_view else self.baseline_params.get('method', ''))
         use_baseline_vis = (method != 'Disable' and getattr(self, 'chk_show_baseline', None) and self.chk_show_baseline.isChecked())
@@ -2375,9 +2398,9 @@ class MainWindow(QtWidgets.QMainWindow):
             res = data['results'][idx]
             vis_signal = res[kind+'_trace'] * (-1 if res['negative_going'] else 1)
         elif getattr(self, 'chk_show_cs', None) and self.chk_show_cs.isChecked():
-            vis_signal = apply_filter(vis_source, fs, low=float(self.spin_cs_low.value()), high=float(self.spin_cs_high.value()), order=int(self.spin_cs_order.value()))
+            vis_signal = protected_filter(vis_source, fs, self.params, low=float(self.spin_cs_low.value()), high=float(self.spin_cs_high.value()), order=int(self.spin_cs_order.value()))
         elif getattr(self, 'chk_show_ss', None) and self.chk_show_ss.isChecked():
-            vis_signal = apply_filter(vis_source, fs, low=float(self.spin_ss_low.value()), high=float(self.spin_ss_high.value()), order=int(self.spin_ss_order.value()))
+            vis_signal = protected_filter(vis_source, fs, self.params, low=float(self.spin_ss_low.value()), high=float(self.spin_ss_high.value()), order=int(self.spin_ss_order.value()))
         else:
             vis_signal = vis_source
         return np.asarray(vis_signal, dtype=float), np.asarray(t), float(fs)
@@ -2392,11 +2415,10 @@ class MainWindow(QtWidgets.QMainWindow):
         fs = float(data['fs'])
         frames = int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0
         if data.get('loaded_detection_result'):
-            raw_proc = np.asarray(data['processed_raw_data'][:, idx])
+            raw_proc = _display_processed_raw(data, idx)
             baseline = np.asarray(data['baseline_traces'][:, idx])
         else:
-            raw_proc = apply_frame_processing(raw, frames=frames, mode=self._get_frame_processing_mode())
-            baseline = self.compute_baseline(raw_proc, fs)
+            raw_proc, baseline, _ = protected_preprocess(raw, fs, self.params, self.baseline_params, frames, self._get_frame_processing_mode())
         sig = raw_proc - baseline
         if bool(data.get('_saved_detection_params', self.params).get('NEGATIVE_GOING', True)):
             sig = -sig
@@ -2412,13 +2434,13 @@ class MainWindow(QtWidgets.QMainWindow):
         fs = float(data['fs'])
         frames = int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0
         if data.get('loaded_detection_result'):
-            raw_proc = np.asarray(data['processed_raw_data'][:, idx])
+            raw_proc = _display_processed_raw(data, idx)
             baseline = np.asarray(data['baseline_traces'][:, idx])
         else:
-            raw_proc = apply_frame_processing(raw, frames=frames, mode=self._get_frame_processing_mode())
-            baseline = self.compute_baseline(raw_proc, fs)
+            raw_proc, baseline, _ = protected_preprocess(raw, fs, self.params, self.baseline_params, frames, self._get_frame_processing_mode())
         corrected = raw_proc - baseline
-        return np.asarray(corrected, dtype=float), t, fs
+        valid = data.get('analysis_valid_mask') if data.get('loaded_detection_result') else observation_mask(len(t), fs, self.params)
+        return np.asarray(corrected, dtype=float)[valid], t[valid], fs
 
     def _get_waveform_source_trace_for_stats(self, sdata, cell_idx):
         """Return a unified waveform source trace for SNR/FWHM stats.
@@ -2440,9 +2462,9 @@ class MainWindow(QtWidgets.QMainWindow):
             raw_cell = np.asarray(raw_mat[:, i], dtype=float)
             frames = int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0
             mode = self._get_frame_processing_mode() if hasattr(self, '_get_frame_processing_mode') else 'Rolling average'
-            raw_proc = apply_frame_processing(raw_cell, frames=frames, mode=mode)
-            baseline = self.compute_baseline(raw_proc, fs) if hasattr(self, 'compute_baseline') else np.zeros_like(raw_proc)
+            raw_proc, baseline, valid = protected_preprocess(raw_cell, fs, self.params, self.baseline_params, frames, mode)
             trace = np.asarray(raw_proc - baseline, dtype=float)
+            trace[~valid] = np.nan
             if bool(self.params.get('NEGATIVE_GOING', True)):
                 trace = -np.asarray(trace, dtype=float)
             return np.asarray(trace, dtype=float)
@@ -2488,11 +2510,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_template_selection_button_text(self):
         if self.btn_select_templates is None:
             return
-        self.btn_select_templates.setText('Save templates' if self.template_selection_active else 'Select templates')
+        self.btn_select_templates.setText(('Save Labels' if self.template_selection_type == 'LABEL' else 'Save Templates') if self.template_selection_active else 'Select As')
         if self.btn_abort_templates is not None:
             self.btn_abort_templates.setEnabled(bool(self.template_selection_active))
 
     def abort_template_selection(self):
+        self._template_records.clear()
+        self._label_drafts.clear()
         self.template_selection_active = False
         self.template_selected_segments['CS'] = []
         self.template_selected_segments['SS'] = []
@@ -2502,14 +2526,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_plot()
 
     def toggle_template_selection_or_save(self):
+        if not isinstance(self.data, dict):
+            QMessageBox.warning(self, 'No Data', 'Load a recording first.')
+            return
         if self.template_selection_active:
-            self.save_selected_templates()
+            if self.template_selection_type == 'LABEL':
+                self.save_selected_labels()
+            else:
+                self.save_selected_templates()
             return
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle('Select templates')
+        dlg.setWindowTitle('Select As')
         form = QtWidgets.QFormLayout(dlg)
         combo_type = QtWidgets.QComboBox(dlg)
-        combo_type.addItems(['CS', 'SS'])
+        combo_type.addItem('CS template', 'CS')
+        combo_type.addItem('SS template', 'SS')
+        combo_type.addItem('Spike label', 'LABEL')
         spin_cs_w = QtWidgets.QDoubleSpinBox(dlg); spin_cs_w.setRange(1.0, 200.0); spin_cs_w.setDecimals(1); spin_cs_w.setSuffix(' ms')
         spin_ss_w = QtWidgets.QDoubleSpinBox(dlg); spin_ss_w.setRange(1.0, 100.0); spin_ss_w.setDecimals(1); spin_ss_w.setSuffix(' ms')
         spin_cs_w.setValue(float(self.params.get('TEMPLATE_CS_WINDOW_MS', 30.0)))
@@ -2517,9 +2549,13 @@ class MainWindow(QtWidgets.QMainWindow):
         _set_input_tooltip(combo_type, SETTING_TOOLTIPS['combo_type'])
         _set_input_tooltip(spin_cs_w, SETTING_TOOLTIPS['spin_cs_w'])
         _set_input_tooltip(spin_ss_w, SETTING_TOOLTIPS['spin_ss_w'])
-        form.addRow('Template type:', combo_type)
+        form.addRow('Type:', combo_type)
         form.addRow('CS window:', spin_cs_w)
         form.addRow('SS window:', spin_ss_w)
+        help_label = QtWidgets.QLabel('Templates: left click selects a window; right click removes it. Labels: left click adds SS; Control + left click adds CS; right click removes the nearest label. Selections stay with their original cell/session.')
+        help_label.setWordWrap(True)
+        form.addRow(help_label)
+        combo_type.currentIndexChanged.connect(lambda _i: (spin_cs_w.setEnabled(combo_type.currentData() != 'LABEL'), spin_ss_w.setEnabled(combo_type.currentData() != 'LABEL')))
         try:
             bb_buttons = QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         except Exception:
@@ -2537,37 +2573,218 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.params['TEMPLATE_CS_WINDOW_MS'] = float(spin_cs_w.value())
         self.params['TEMPLATE_SS_WINDOW_MS'] = float(spin_ss_w.value())
-        self.template_selection_type = str(combo_type.currentText()).upper()
+        self.template_selection_type = str(combo_type.currentData())
         self.template_selection_window_ms = float(self.params['TEMPLATE_CS_WINDOW_MS'] if self.template_selection_type == 'CS' else self.params['TEMPLATE_SS_WINDOW_MS'])
         self.template_selection_active = True
-        self.template_selected_segments[self.template_selection_type] = []
-        self.template_selected_intervals_ms[self.template_selection_type] = []
+        if self.template_selection_type == 'LABEL':
+            try:
+                self._label_draft()
+            except (ValueError, OSError) as exc:
+                self.template_selection_active = False
+                QMessageBox.warning(self, 'Load Labels', str(exc))
         self._reset_template_selection_button_text()
         self.update_plot()
 
+    def _annotation_session_id(self, data=None):
+        data = self.data if data is None else data
+        if data.get('source_session_id'):
+            return str(data['source_session_id'])
+        return str(Path(data.get('session_path') or Path(data.get('source_folder', self.master_folder))/self.selected_session).resolve())
+
+    def _label_draft(self):
+        sid = self._annotation_session_id()
+        if sid not in self._label_drafts:
+            saved = self.data if self.data.get('is_manual_labels') else None
+            if saved is None:
+                destination = output_paths(self.data, self.master_folder)[0]
+                label_path = destination.with_name(destination.stem.removesuffix('_analyzed')+'_labels.npz')
+                if label_path.is_file():
+                    saved = load_saved_detection(label_path)
+                    if (saved['cell_names'] != self.data['cell_names'] or
+                            not np.array_equal(saved['time_ms'], self.data['time_ms']) or
+                            not np.array_equal(saved['raw_data'], self.data['raw_data'])):
+                        raise ValueError('Existing manual labels do not match this recording; kept them unchanged.')
+            events = [{kind: (np.asarray(saved['results'][i][kind.lower()+'_peaks'], int).tolist() if saved is not None else [])
+                       for kind in ('CS', 'SS')} for i in range(len(self.data['cell_names']))]
+            self._label_drafts[sid] = dict(data=self.data, events=events,
+                settings=self._current_settings_snapshot(),
+                visited=set(saved.get('label_metadata', {}).get('labelled_cells', [i for i, ev in enumerate(events) if any(ev.values())])) if saved is not None else set(), dirty=False,
+                viewed_intervals={int(k): v for k,v in saved.get('label_metadata', {}).get('viewed_intervals_ms', {}).items()} if saved is not None else {}, name=self.selected_session)
+        draft = self._label_drafts[sid]
+        return draft
+
     def on_main_plot_click(self, event):
-        if not self.template_selection_active:
+        try:
+            self._handle_annotation_click(event)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, 'Annotation', str(exc))
+
+    def _handle_annotation_click(self, event):
+        if not self.template_selection_active or event is None or event.inaxes is None or event.xdata is None:
             return
-        if event is None or event.inaxes is None or event.xdata is None:
+        if event.button not in (1, 3):
             return
-        sig, t, fs = self._get_current_template_signal_full()
-        if sig is None or t is None or fs is None or sig.size <= 3:
+        if getattr(self.canvas, 'toolbar', None) is not None and self.canvas.toolbar.mode:
             return
-        center_ms = float(event.xdata)
-        half_ms = self.template_selection_window_ms / 2.0
-        start_ms = center_ms - half_ms
-        end_ms = center_ms + half_ms
-        mask = (t >= start_ms) & (t <= end_ms)
-        seg = np.asarray(sig[mask], dtype=float)
-        if seg.size <= 3:
-            return
-        self.template_selected_segments[self.template_selection_type].append(seg)
-        self.template_selected_intervals_ms[self.template_selection_type].append((start_ms, end_ms))
+        sid, cell = self._annotation_session_id(), max(0, self.selected_cell)
+        t, fs = np.asarray(self.data['time_ms']), float(self.data['fs'])
+        center = int(np.argmin(np.abs(t-float(event.xdata))))
+        if self.template_selection_type == 'LABEL':
+            draft = self._label_draft()
+            labels = draft['events'][cell]
+            if event.button == 3:
+                choices = [(abs(event.inaxes.transData.transform((t[p], 0))[0]-event.x), kind, p)
+                           for kind in ('CS','SS') for p in labels[kind]]
+                if choices:
+                    distance, kind, peak = min(choices)
+                    if distance <= 10:
+                        labels[kind].remove(peak); draft['dirty'] = True; draft['visited'].add(cell)
+            else:
+                if not observation_mask(len(t), fs, draft['settings']['params'])[center]:
+                    self.statusBar().showMessage('This sample is in a recording boundary blank; no label added.')
+                    return
+                key = str(getattr(event, 'key', '') or '').lower()
+                control = ('control' in key or 'ctrl' in key or
+                           bool(QtWidgets.QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier))
+                draft['visited'].add(cell)
+                kind = 'CS' if control else 'SS'
+                other = 'SS' if control else 'CS'
+                if center in labels[other]:
+                    labels[other].remove(center); draft['dirty'] = True
+                if center not in labels[kind]:
+                    labels[kind].append(center); labels[kind].sort(); draft['dirty'] = True
+                window = self._get_current_window_mask(t)
+                draft['viewed_intervals'].setdefault(cell, []).append([float(t[window][0]), float(t[window][-1])])
+        elif event.button == 3:
+            choices = [(abs(r['center_ms']-event.xdata), i) for i, r in enumerate(self._template_records)
+                       if r['session_id'] == sid and r['cell'] == cell and r['start_ms'] <= event.xdata <= r['end_ms']]
+            if choices:
+                self._template_records.pop(min(choices)[1])
+        else:
+            sig, _, _ = self._get_current_template_signal_full()
+            half = int(round(self.template_selection_window_ms*fs/2000))
+            indices = np.arange(center-half, center+half+1)
+            valid = observation_mask(len(t), fs, self.params)
+            if len(indices) < 4 or indices[0] < 0 or indices[-1] >= len(t) or not np.all(valid[indices]):
+                self.statusBar().showMessage('Select a complete template window within the observed recording interval.')
+                return
+            start, end = float(t[indices[0]]), float(t[indices[-1]])
+            if any(r['session_id'] == sid and r['cell'] == cell and r['kind'] == self.template_selection_type and r.get('center_index') == center for r in self._template_records):
+                return
+            profile = self.data.get('_saved_settings_snapshot') or self._current_settings_snapshot()
+            self._template_records.append(dict(session_id=sid, session=self.selected_session,
+                cell=cell, cell_name=self.data['cell_names'][cell], kind=self.template_selection_type,
+                center_ms=float(t[center]), center_index=center, start_ms=start, end_ms=end, fs=fs,
+                segment=np.asarray(sig[indices]).copy(), negative_going=bool(profile['params'].get('NEGATIVE_GOING', True)),
+                baseline_params=dict(profile['baseline_params']), frames=profile['ui']['avg_frames'],
+                frame_mode=profile['params'].get('FRAME_PROCESSING_MODE', 'Rolling average')))
         self.update_plot()
+
+    def save_selected_labels(self):
+        if getattr(self, '_label_save_worker', None) is not None:
+            return
+        current = self._label_draft()
+        current['visited'].add(max(0, self.selected_cell))  # Explicit Save also supports an empty current-cell label set.
+        plans = []
+        for sid, draft in self._label_drafts.items():
+            if not draft['visited'] and not draft['dirty']:
+                continue
+            destination = output_paths(draft['data'], self.master_folder)[0]
+            destination = destination.with_name(destination.stem.removesuffix('_analyzed')+'_labels.npz')
+            job = dict(draft, settings=copy.deepcopy(draft['settings']),
+                       events=copy.deepcopy(draft['events']), visited=set(draft['visited']),
+                       viewed_intervals=copy.deepcopy(draft['viewed_intervals']))
+            plans.append((sid, job, destination))
+        existing = [p for _, _, dest in plans for p in (dest, dest.with_name(dest.stem+'_settings.json')) if p.exists()]
+        if existing and not self._confirm_result_replacement(existing):
+            return
+        approved = {str(p.resolve()) for p in existing}
+        self.centralWidget().setEnabled(False)
+        self.detection_progress.setRange(0, 0)
+        self.detection_progress.setFormat('Saving Labels…')
+        worker = _DetectionCellThread(lambda: self._write_label_sessions(plans, approved), self)
+        self._label_save_worker = worker
+        worker.result_ready.connect(self._labels_save_ready)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _write_label_sessions(self, plans, approved):
+        errors, completed = [], []
+        for sid, draft, destination in plans:
+            stage = stage_cfg = None
+            try:
+                data, settings = draft['data'], draft['settings']
+                params = settings['params']; params['COMBO_DETECTION'] = False
+                denoise = default_denoise_config()
+                for name in denoise:
+                    key = 'DENOISE_'+name.upper()
+                    if key in params:
+                        denoise[name] = params[key]
+                view = dict(data)
+                view.pop('_control_context', None)
+                view['results'] = [manual_result(data['raw_data'][:, i], data['fs'], settings, events,
+                    _detect_cell, denoise) for i, events in enumerate(draft['events'])]
+                for kind in ('cs','ss'):
+                    view['spike_times_'+kind] = [data['time_ms'][r[kind+'_peaks']] for r in view['results']]
+                view['result_method'] = 'Manual labels'
+                view['effective_settings'] = effective_settings(params, settings['baseline_params'], settings['ui']['avg_frames'], data['fs'], len(data['time_ms']))
+                payload = self._build_detection_export(view, settings=settings)
+                label_meta = dict(version=1, source_session_id=sid,
+                    source_session=draft['name'], labelled_cells=sorted(draft['visited']),
+                    cell_names=data['cell_names'], completeness='partial; absence of a label is not a confirmed negative',
+                    initial_source='empty or previously saved manual labels; automatic detections never imported',
+                    viewed_intervals_ms=draft['viewed_intervals'], qc_rejection_applied=False,
+                    timestamp_convention='nearest native input sample; original time origin preserved')
+                payload['label_metadata_json'] = json.dumps(json_safe(label_meta))
+                stage = Path(self._temporary_store.allocate(destination.stem))
+                np.savez_compressed(stage, **payload)
+                stage_cfg = stage.with_name(stage.stem+'_settings.json')
+                cfg = dict(settings, results_file=destination.name,
+                           analysis_settings=json.loads(payload['analysis_settings_json']))
+                stage_cfg.write_text(json.dumps(cfg, indent=2))
+                # Validate before replacing any prior label file.
+                load_saved_detection(stage)
+                publish_detection(stage, stage_cfg, destination, approved)
+                restored = load_saved_detection(destination)
+                preserved = {key: data[key] for key in ('session_name','session_path','source_folder','output_basename') if key in data}
+                completed.append((sid, restored, preserved, str(destination)))
+            except Exception as exc:
+                errors.append(f"{draft['name']}: {exc}")
+            finally:
+                for path in (stage, stage_cfg):
+                    if path is not None:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            errors.append(f'Temporary cleanup deferred: {exc}')
+        return completed, errors
+
+    def _labels_save_ready(self, payload, error):
+        self._label_save_worker.wait(1000)
+        self._label_save_worker = None
+        self.centralWidget().setEnabled(True)
+        self.detection_progress.setRange(0, 1); self.detection_progress.setValue(1)
+        self.detection_progress.setFormat('Ready')
+        completed, errors = payload if error is None else ([], [str(error)])
+        for sid, restored, preserved, destination in completed:
+            data = self._label_drafts[sid]['data']
+            data.clear(); data.update(restored); data.update(preserved)
+        if errors:
+            QMessageBox.warning(self, 'Save Labels', 'Some labels could not be saved; drafts retained.\n'+'\n'.join(errors))
+        else:
+            self._label_drafts.clear(); self.template_selection_active = False
+            self._reset_template_selection_button_text()
+        if completed and self.data.get('is_manual_labels'):
+            self._restore_saved_run_settings(self.data)
+        self.update_plot()
+        if completed:
+            self.statusBar().showMessage(f'Saved manual labels for {len(completed)} session(s). Spike Statistics now uses these labels.')
+            QMessageBox.information(self, 'Labels Saved', '\n'.join(row[3] for row in completed))
 
     def save_selected_templates(self):
         st = self.template_selection_type
-        segs = self.template_selected_segments.get(st, [])
+        records = [r for r in self._template_records if r['kind'] == st]
+        segs = [r['segment'] for r in records]
         if len(segs) == 0:
             QMessageBox.warning(self, 'No templates', 'No selected periods yet. Click on the trace to select template windows.')
             return
@@ -2584,15 +2801,16 @@ class MainWindow(QtWidgets.QMainWindow):
         old = {}
         if os.path.exists(filename):
             try:
-                old_npz = np.load(filename, allow_pickle=True)
-                old = {k: old_npz[k] for k in old_npz.files}
+                with np.load(filename, allow_pickle=True) as old_npz:
+                    old = {k: old_npz[k] for k in old_npz.files}
             except Exception:
                 old = {}
 
         payload = dict(old)
         target_fs = float(TEMPLATE_TARGET_FS)
-        upsampled = [_resample_template_to_fs(np.asarray(s, dtype=float).ravel(), fs, target_fs) for s in segs]
+        upsampled = [_resample_template_to_fs(np.asarray(r['segment'], dtype=float).ravel(), r['fs'], target_fs) for r in records]
         payload['fs'] = float(target_fs)
+        payload[st.lower()+'_selection_metadata_json'] = json.dumps([{k:v for k,v in r.items() if k != 'segment'} for r in records])
         seg_arr = np.array(upsampled, dtype=object)
         if st == 'CS':
             payload['cs_waveforms'] = seg_arr
@@ -2632,6 +2850,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_template_status_label()
 
         self.template_selection_active = False
+        self._template_records = [r for r in self._template_records if r['kind'] != st]
         self.template_selected_segments[st] = []
         self.template_selected_intervals_ms[st] = []
         self._reset_template_selection_button_text()
@@ -2739,7 +2958,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'DENOISE_MOVING_CYCLES', 'DENOISE_MAX_TIMEPOINTS_FOR_CLUSTERING',
             'DENOISE_EVENT_REFINE_ENABLED', 'DENOISE_EVENT_REFINE_WINDOW_MS',
             'DENOISE_EVENT_REFINE_SIGMA', 'DENOISE_EVENT_REFINE_PC1_Z_CUTOFF',
-            'DENOISE_EVENT_REFINE_ATTENUATION', 'FRAME_PROCESSING_MODE',
+            'DENOISE_EVENT_REFINE_ATTENUATION', 'FRAME_PROCESSING_MODE', 'INITIAL_BLANK_MS', 'FINAL_BLANK_MS',
         ]
         vals = tuple((k, self.params.get(k, None)) for k in keys)
         try:
@@ -2778,7 +2997,11 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 key = None
         cfg = self._get_denoise_config()
-        y, meta = adaptive_wavelet_denoise(x, fs, cfg=cfg)
+        start, stop = observation_bounds(len(x), fs, self.params.get('INITIAL_BLANK_MS', 150), self.params.get('FINAL_BLANK_MS', 50))
+        if stop-start < 128:
+            raise ValueError('Not enough observed samples for denoising.')
+        observed_y, meta = adaptive_wavelet_denoise(x[start:stop], fs, cfg=cfg)
+        y = np.pad(observed_y, (start, len(x)-stop), mode='edge')
         if key is not None:
             try:
                 if len(self._denoise_cache) > 24:
@@ -2849,7 +3072,8 @@ class MainWindow(QtWidgets.QMainWindow):
             },
             'ui': {
                 'center_slider': int(self.slider_time.value()) if hasattr(self, 'slider_time') else 0,
-                'window_ms': float(self.spin_window.value()) if hasattr(self, 'spin_window') else 500.0,
+                'start_at_observation': bool(self._main_view_auto_start),
+                'window_ms': float(self.spin_window.value()) if hasattr(self, 'spin_window') else 1000.0,
                 'y_range': float(self.spin_zoom.value()) if hasattr(self, 'spin_zoom') else 0.0,
                 'avg_frames': int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0,
                 'baseline_method': str(self.combo_baseline_method.currentText()) if hasattr(self, 'combo_baseline_method') else self.baseline_params.get('method', 'Median'),
@@ -2935,6 +3159,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     for key in ('SS_MASK_PRE_MS', 'SS_MASK_POST_MS'):
                         if key not in loaded_params:
                             self.params.pop(key, None)
+                for prefix in ('DETECTION', 'SLIDER'):
+                    if prefix+'_VIEW_CENTER' in loaded_params:
+                        loaded_params.setdefault(prefix+'_VIEW_AUTO_START', False)
                 loaded_params = migrate_qc_settings(loaded_params)
                 for key in LEGACY_QC_KEYS:
                     self.params.pop(key, None)
@@ -2997,6 +3224,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             try:
                 self.slider_time.setValue(int(loaded_ui.get('center_slider', self.slider_time.value())))
+                self._main_view_auto_start = bool(loaded_ui.get('start_at_observation', 'center_slider' not in loaded_ui))
             except Exception:
                 pass
             try:
@@ -3097,11 +3325,23 @@ class MainWindow(QtWidgets.QMainWindow):
             QMessageBox.critical(self, 'Load Settings Error', str(e))
             return False
 
+    def _confirm_discard_annotations(self):
+        if not (self._template_records or self._label_drafts):
+            return True
+        answer = QMessageBox.question(self, 'Unsaved Annotations',
+            'Opening another folder discards unsaved labels/template selections. Continue?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.abort_template_selection()
+        return True
+
     def open_saved_session(self):
         if getattr(self, '_saved_load_worker', None) is not None:
             return
         folder = QFileDialog.getExistingDirectory(self, 'Load Saved Detection Folder', self.master_folder or os.path.expanduser('~'))
-        if not folder:
+        if not folder or not self._confirm_discard_annotations():
             return
         self.centralWidget().setEnabled(False)
         self.detection_progress.setRange(0, 0)
@@ -3161,6 +3401,10 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = copy.deepcopy(self._default_settings_snapshot)
         for key in ('params', 'baseline_params', 'ui', 'colors'):
             cfg[key].update(copy.deepcopy(saved.get(key, {})))
+        cfg['ui']['start_at_observation'] = saved.get('ui', {}).get('start_at_observation', 'center_slider' not in saved.get('ui', {}))
+        for prefix in ('DETECTION', 'SLIDER'):
+            prior = saved.get('params', {})
+            cfg['params'][prefix+'_VIEW_AUTO_START'] = prior.get(prefix+'_VIEW_AUTO_START', prefix+'_VIEW_CENTER' not in prior)
         cfg['app_version'] = saved.get('app_version', '')
         cfg['template_sources'] = copy.deepcopy(saved.get('template_sources', {'CS': [], 'SS': []}))
         self.params = copy.deepcopy(cfg['params'])
@@ -3169,7 +3413,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Select Master Folder', os.path.expanduser('~'))
-        if folder:
+        if folder and self._confirm_discard_annotations():
             self.master_folder = folder
             self.statusBar().showMessage(f'Master folder: {folder}')
             self.refresh_sessions()
@@ -3363,6 +3607,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(0, self.open_detection_viewer)
 
     def closeEvent(self, event):
+        if getattr(self, '_label_save_worker', None) is not None:
+            event.ignore()
+            self.statusBar().showMessage('Labels are being saved; close after saving finishes.')
+            return
         if getattr(self, '_saved_load_worker', None) is not None:
             event.ignore()
             self.statusBar().showMessage('Saved session is still loading; close after it finishes.')
@@ -3372,6 +3620,14 @@ class MainWindow(QtWidgets.QMainWindow):
             event.ignore()
             self.statusBar().showMessage('Detection is still running; close after it finishes.')
             return
+        if self._template_records or any(d.get('dirty') for d in self._label_drafts.values()):
+            answer = QMessageBox.question(self, 'Unsaved Annotations',
+                'Discard unsaved labels/template selections and close?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         try:
             self._temporary_store.close()
         except OSError as exc:
@@ -3390,6 +3646,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return box.exec() == QMessageBox.StandardButton.Yes
 
     def _detection_steps(self):
+        if self.template_selection_active:
+            QMessageBox.warning(self, 'Annotation Active', 'Save Labels / Save Templates or Abort before starting detection.')
+            return 0, 0
         if not self.sessions:
             QMessageBox.warning(self, 'No data', 'No sessions loaded. Select a folder first.')
             return 0, 0
@@ -3472,7 +3731,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 data['effective_settings'] = effective
                 n_cells = data['raw_data'].shape[1]
                 for key in ('loaded_detection_result', '_saved_settings_snapshot',
-                            '_saved_detection_params', 'processed_raw_data', 'baseline_traces'):
+                            '_saved_detection_params', 'processed_raw_data', 'baseline_traces',
+                            'is_manual_labels', 'label_metadata', 'analysis_valid_mask', 'result_method'):
                     data.pop(key, None)
                 data.pop('results_file', None)
                 data.pop('settings_file', None)
@@ -3520,208 +3780,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     save_target = str(self._temporary_store.allocate(base))
                     # Prepare arrays for saving to match notebook structure and downstream analyses.
                     try:
-                        time_ms = np.array(data.get('time_ms', []))
-                        raw_data = np.array(data.get('raw_data', []))
-                        fs_save = float(data.get('fs', 1000.0))
-                        avg_frames_save = int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0
-                        frame_mode_save = self._get_frame_processing_mode() if hasattr(self, '_get_frame_processing_mode') else 'Rolling average'
-                        # Build cs_traces and ss_traces column-stacked if results exist
-                        cs_traces = np.array([])
-                        ss_traces = np.array([])
-                        raw_sigmas = np.array([])
-                        processed_raw_data = np.array([])
-                        baseline_traces = np.array([])
-                        event_snr_cs = []
-                        event_snr_ss = []
-                        event_fwhm_cs = []
-                        event_fwhm_ss = []
-                        event_minus_dff_percent_cs = []
-                        event_minus_dff_percent_ss = []
-                        event_waveforms_minus_dff_percent_cs = []
-                        event_waveforms_minus_dff_percent_ss = []
-                        try:
-                            res_list = data.get('results', [])
-                            if res_list and len(time_ms) > 0:
-                                n_samples = len(time_ms)
-                                cs_traces = np.column_stack([r.get('cs_trace', np.zeros(n_samples)) if r is not None else np.zeros(n_samples) for r in res_list])
-                                ss_traces = np.column_stack([r.get('ss_trace', np.zeros(n_samples)) if r is not None else np.zeros(n_samples) for r in res_list])
-                                raw_sigmas = np.array([r.get('raw_sigma', np.nan) if r is not None else np.nan for r in res_list])
-                                proc_cols = []
-                                base_cols = []
-                                for cell_i in range(raw_data.shape[1] if raw_data.ndim == 2 else 0):
-                                    if cell_i % 8 == 0:
-                                        QtWidgets.QApplication.processEvents()
-                                    raw_cell_i = np.asarray(raw_data[:, cell_i], dtype=float)
-                                    raw_proc_i = apply_frame_processing(raw_cell_i, frames=avg_frames_save, mode=frame_mode_save)
-                                    try:
-                                        base_i = self.compute_baseline(raw_proc_i, fs_save)
-                                    except Exception:
-                                        base_i = np.zeros_like(raw_proc_i)
-                                    proc_cols.append(np.asarray(raw_proc_i, dtype=float))
-                                    base_cols.append(np.asarray(base_i, dtype=float))
-                                if len(proc_cols) > 0:
-                                    processed_raw_data = np.column_stack(proc_cols)
-                                    baseline_traces = np.column_stack(base_cols)
-
-                                def _minus_dff_at_event(raw_proc_arr, baseline_arr, peak_idx, spike_type):
-                                    p0 = int(peak_idx)
-                                    n = int(raw_proc_arr.size)
-                                    win_ms = _stats_window_ms(spike_type)
-                                    half = max(2, int(round((win_ms * 0.25 / 1000.0) * fs_save)))
-                                    s0 = max(0, p0 - half)
-                                    e0 = min(n, p0 + half + 1)
-                                    if e0 <= s0:
-                                        return np.nan
-                                    local = raw_proc_arr[s0:e0]
-                                    if bool(self.params.get('NEGATIVE_GOING', True)):
-                                        pk = int(s0 + np.nanargmin(local))
-                                    else:
-                                        pk = int(s0 + np.nanargmax(local))
-                                    f0 = float(baseline_arr[pk]) if 0 <= pk < baseline_arr.size else np.nan
-                                    if (not np.isfinite(f0)) or abs(f0) <= 1e-12:
-                                        return np.nan
-                                    dff = 100.0 * (float(raw_proc_arr[pk]) - f0) / abs(f0)
-                                    return float(-dff if bool(self.params.get('NEGATIVE_GOING', True)) else dff)
-
-                                def _event_waveforms_minus_dff(raw_proc_arr, baseline_arr, peaks, spike_type):
-                                    out = []
-                                    half = int(round((_stats_window_ms(spike_type) / 2.0 / 1000.0) * fs_save))
-                                    if half < 2:
-                                        return np.array([], dtype=object)
-                                    for pp in np.asarray(peaks, dtype=int).ravel():
-                                        s0 = int(pp) - half
-                                        e0 = int(pp) + half
-                                        if s0 < 0 or e0 > raw_proc_arr.size:
-                                            continue
-                                        denom = np.where(np.abs(baseline_arr[s0:e0]) > 1e-12, np.abs(baseline_arr[s0:e0]), np.nan)
-                                        w = 100.0 * (raw_proc_arr[s0:e0] - baseline_arr[s0:e0]) / denom
-                                        if bool(self.params.get('NEGATIVE_GOING', True)):
-                                            w = -w
-                                        out.append(np.asarray(w, dtype=float))
-                                    return np.array(out, dtype=object)
-
-                                for cell_i, r in enumerate(res_list):
-                                    if cell_i % 8 == 0:
-                                        QtWidgets.QApplication.processEvents()
-                                    if r is None:
-                                        event_snr_cs.append(np.array([], dtype=float))
-                                        event_snr_ss.append(np.array([], dtype=float))
-                                        event_fwhm_cs.append(np.array([], dtype=float))
-                                        event_fwhm_ss.append(np.array([], dtype=float))
-                                        event_minus_dff_percent_cs.append(np.array([], dtype=float))
-                                        event_minus_dff_percent_ss.append(np.array([], dtype=float))
-                                        event_waveforms_minus_dff_percent_cs.append(np.array([], dtype=object))
-                                        event_waveforms_minus_dff_percent_ss.append(np.array([], dtype=object))
-                                        continue
-                                    trace_stats = self._get_waveform_source_trace_for_stats(data, cell_i)
-                                    if trace_stats is None:
-                                        trace_stats = np.asarray(r.get('detrended', np.zeros(n_samples)), dtype=float)
-                                    cs_peaks_i = np.asarray(r.get('cs_peaks', []), dtype=int)
-                                    ss_peaks_i = np.asarray(r.get('ss_peaks', []), dtype=int)
-                                    try:
-                                        cs_snr_i = np.asarray(compute_event_snrs(r, 'CS', fs_save, window_ms=_stats_window_ms('CS'), max_per_cell=None, trace_override=trace_stats), dtype=float)
-                                    except Exception:
-                                        cs_snr_i = np.array([], dtype=float)
-                                    try:
-                                        ss_snr_i = np.asarray(compute_event_snrs(r, 'SS', fs_save, window_ms=_stats_window_ms('SS'), max_per_cell=None, trace_override=trace_stats), dtype=float)
-                                    except Exception:
-                                        ss_snr_i = np.array([], dtype=float)
-                                    cs_fwhm_i = np.asarray([row['fwhm_ms'] for row in r.get('event_widths_cs', [])], dtype=float)
-                                    ss_fwhm_i = np.asarray([row['fwhm_ms'] for row in r.get('event_widths_ss', [])], dtype=float)
-                                    raw_proc_i = processed_raw_data[:, cell_i] if processed_raw_data.ndim == 2 and cell_i < processed_raw_data.shape[1] else np.asarray(raw_data[:, cell_i], dtype=float)
-                                    base_i = baseline_traces[:, cell_i] if baseline_traces.ndim == 2 and cell_i < baseline_traces.shape[1] else np.zeros_like(raw_proc_i)
-                                    event_snr_cs.append(cs_snr_i)
-                                    event_snr_ss.append(ss_snr_i)
-                                    event_fwhm_cs.append(cs_fwhm_i)
-                                    event_fwhm_ss.append(ss_fwhm_i)
-                                    event_minus_dff_percent_cs.append(np.asarray([_minus_dff_at_event(raw_proc_i, base_i, pp, 'CS') for pp in cs_peaks_i], dtype=float))
-                                    event_minus_dff_percent_ss.append(np.asarray([_minus_dff_at_event(raw_proc_i, base_i, pp, 'SS') for pp in ss_peaks_i], dtype=float))
-                                    event_waveforms_minus_dff_percent_cs.append(_event_waveforms_minus_dff(raw_proc_i, base_i, cs_peaks_i, 'CS'))
-                                    event_waveforms_minus_dff_percent_ss.append(_event_waveforms_minus_dff(raw_proc_i, base_i, ss_peaks_i, 'SS'))
-                            else:
-                                cs_traces = np.array([])
-                                ss_traces = np.array([])
-                                raw_sigmas = np.array([])
-                        except Exception:
-                            cs_traces = np.array([])
-                            ss_traces = np.array([])
-                            raw_sigmas = np.array([])
-
-                        analysis_settings = {
-                            'app_version': APP_VERSION,
-                            'detection_method': detection_method,
-                            'combo_detection': combo_enabled,
-                            'template_whitening_cells': [res.get('template_whitening') for res in data['results']],
-                            'combo_cells': [res.get('combo') for res in data['results']] if combo_enabled else [],
-                            'timestamp_convention': 'input time_ms, original origin preserved',
-                            'input_time_unit': data.get('input_time_unit', 'ms'),
-                            'input_warnings': list(data.get('load_warnings', [])),
-                            'effective_settings': effective,
-                            'width_policy': 'candidate-centered; uncertain retained with NaN',
-                            'ss_mask_policy': 'pre/post exclusion without signal zeroing; template support also excluded',
-                            'baseline_params': dict(self.baseline_params),
-                            'frame_processing_mode': frame_mode_save,
-                            'avg_frames': int(avg_frames_save),
-                            'negative_going': bool(self.params.get('NEGATIVE_GOING', True)),
-                            'params': dict(self.params),
-                            'stats_windows_ms': {'CS': _stats_window_ms('CS'), 'SS': _stats_window_ms('SS')},
-                            'event_snr_policy': dict(EVENT_SNR_POLICY),
-                            'event_metric_units': {
-                                'event_minus_dff_percent': '-dF/F (%) for negative-going traces',
-                                'event_snr': 'amplitude / local MAD sigma, matching Spike Statistics',
-                                'event_fwhm_ms': 'FWHM in ms, matching Spike Statistics source traces',
-                            },
-                        }
-
-                        cs_masks = np.column_stack([r['cs_exclusion_mask'] for r in data['results']])
-                        ss_masks = np.column_stack([r['ss_exclusion_mask'] for r in data['results']])
-                        width_report = [{key: r.get(key, []) for key in
-                            ('cs_width_candidates', 'ss_width_candidates', 'event_widths_cs', 'event_widths_ss')}
-                            for r in data['results']]
-                        width_report = [{key: [{field: (None if isinstance(value, (float, np.floating)) and not np.isfinite(value) else value)
-                            for field, value in row.items()} for row in rows] for key, rows in cell.items()} for cell in width_report]
-                        runtime_fields = ('det_method', 'threshold_mode', 'negative_going', 'local_baseline',
-                            'sigma_cs', 'sigma_ss', 'cs_threshold_used', 'ss_threshold_used',
-                            'cs_candidate_diagnostics', 'ss_candidate_diagnostics', 'width_alignment_ms',
-                            'template_whitening', 'combo', 'denoise_enabled', 'denoise_meta',
-                            'ss_fwhm_filter_removed', 'ss_fwhm_filter_uncertain', 'ss_width_source',
-                            'cs_detection_enabled', 'ss_detection_enabled')
-                        runtime = [{key: r[key] for key in runtime_fields if key in r} for r in data['results']]
-                        extra_traces = {key + 's': np.column_stack([
-                            r.get(key, np.full(n_samples, np.nan)) for r in data['results']])
-                            for key in ('cs_similarity_trace', 'ss_similarity_trace', 'cs_threshold_trace', 'ss_threshold_trace')}
-                        save_payload = dict(
-                                            **extra_traces,
-                                            detection_runtime_json=json.dumps(json_safe(runtime), allow_nan=False),
-                                            gui_settings_json=json.dumps(self._current_settings_snapshot()),
-                                            cs_exclusion_mask=cs_masks, ss_exclusion_mask=ss_masks,
-                                            recording_duration_s=len(time_ms)/fs_save,
-                                            valid_duration_cs_s=np.sum(~cs_masks, axis=0)/fs_save,
-                                            valid_duration_ss_s=np.sum(~ss_masks, axis=0)/fs_save,
-                                            width_quality_json=json.dumps(width_report, allow_nan=False),
-                                            spike_qc_json=json.dumps([r.get('spike_qc', {}) for r in data['results']], allow_nan=False),
-                                            time_ms=time_ms,
-                                            raw_data=raw_data,
-                                            processed_raw_data=processed_raw_data,
-                                            baseline_traces=baseline_traces,
-                                            cs_traces=cs_traces,
-                                            ss_traces=ss_traces,
-                                            spike_times_cs=np.array(data.get('spike_times_cs', []), dtype=object),
-                                            spike_times_ss=np.array(data.get('spike_times_ss', []), dtype=object),
-                                            cell_names=np.array(data.get('cell_names', [])),
-                                            fs=fs_save,
-                                            raw_sigmas=raw_sigmas,
-                                            event_snr_cs=np.array(event_snr_cs, dtype=object),
-                                            event_snr_ss=np.array(event_snr_ss, dtype=object),
-                                            event_fwhm_cs=np.array(event_fwhm_cs, dtype=object),
-                                            event_fwhm_ss=np.array(event_fwhm_ss, dtype=object),
-                                            event_minus_dff_percent_cs=np.array(event_minus_dff_percent_cs, dtype=object),
-                                            event_minus_dff_percent_ss=np.array(event_minus_dff_percent_ss, dtype=object),
-                                            event_waveforms_minus_dff_percent_cs=np.array(event_waveforms_minus_dff_percent_cs, dtype=object),
-                                            event_waveforms_minus_dff_percent_ss=np.array(event_waveforms_minus_dff_percent_ss, dtype=object),
-                                            analysis_settings_json=json.dumps(analysis_settings),
-                                            baseline_params_json=json.dumps(dict(self.baseline_params)),
-                                            detection_params_json=json.dumps(dict(self.params)))
+                        save_payload = self._build_detection_export(data)
                         yield ('save', lambda save_target=save_target, payload=save_payload:
                                np.savez_compressed(save_target, **payload))
                         settings_target = os.path.splitext(save_target)[0] + '_settings.json'
@@ -3729,7 +3788,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         settings_snapshot.update({
                             'settings_kind': 'spike_detection_sidecar',
                             'results_file': os.path.basename(save_target),
-                            'analysis_settings': analysis_settings,
+                            'analysis_settings': json.loads(save_payload['analysis_settings_json']),
                         })
                         with open(settings_target, 'w', encoding='utf-8') as f:
                             json.dump(settings_snapshot, f, indent=2)
@@ -3794,8 +3853,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         global_ss_fwhm.extend(row['fwhm_ms'] for row in res.get('event_widths_ss', []) if np.isfinite(row['fwhm_ms']))
                         try:
                             if duration_s and duration_s > 0:
-                                global_cs_rates.append(len(res.get('cs_peaks', [])) / duration_s)
-                                global_ss_rates.append(len(res.get('ss_peaks', [])) / duration_s)
+                                global_cs_rates.append(len(res.get('cs_peaks', [])) / (np.sum(~res.get('recording_exclusion_mask', np.zeros(len(tvec), bool)))/fs))
+                                global_ss_rates.append(len(res.get('ss_peaks', [])) / (np.sum(~res.get('recording_exclusion_mask', np.zeros(len(tvec), bool)))/fs))
                         except Exception:
                             pass
                         # CS events
@@ -3980,6 +4039,211 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return sessions_done, total_cells
 
+    def _build_detection_export(self, data, settings=None):
+        settings = copy.deepcopy(settings if settings is not None else self._current_settings_snapshot())
+        params, baseline_params = settings['params'], settings['baseline_params']
+        time_ms = np.array(data.get('time_ms', []))
+        raw_data = np.array(data.get('raw_data', []))
+        fs_save = float(data.get('fs', 1000.0))
+        avg_frames_save = int(settings['ui']['avg_frames'])
+        frame_mode_save = params.get('FRAME_PROCESSING_MODE', 'Rolling average')
+        # Build cs_traces and ss_traces column-stacked if results exist
+        cs_traces = np.array([])
+        ss_traces = np.array([])
+        raw_sigmas = np.array([])
+        processed_raw_data = np.array([])
+        baseline_traces = np.array([])
+        event_snr_cs = []
+        event_snr_ss = []
+        event_fwhm_cs = []
+        event_fwhm_ss = []
+        event_minus_dff_percent_cs = []
+        event_minus_dff_percent_ss = []
+        event_waveforms_minus_dff_percent_cs = []
+        event_waveforms_minus_dff_percent_ss = []
+        res_list = data.get('results', [])
+        if res_list and len(time_ms) > 0:
+            n_samples = len(time_ms)
+            cs_traces = np.column_stack([r.get('cs_trace', np.zeros(n_samples)) if r is not None else np.zeros(n_samples) for r in res_list])
+            ss_traces = np.column_stack([r.get('ss_trace', np.zeros(n_samples)) if r is not None else np.zeros(n_samples) for r in res_list])
+            raw_sigmas = np.array([r.get('raw_sigma', np.nan) if r is not None else np.nan for r in res_list])
+            proc_cols = []
+            base_cols = []
+            for cell_i in range(raw_data.shape[1] if raw_data.ndim == 2 else 0):
+                raw_cell_i = np.asarray(raw_data[:, cell_i], dtype=float)
+                raw_proc_i, base_i, _ = protected_preprocess(raw_cell_i, fs_save, params, baseline_params, avg_frames_save, frame_mode_save)
+                proc_cols.append(np.asarray(raw_proc_i, dtype=float))
+                base_cols.append(np.asarray(base_i, dtype=float))
+            if len(proc_cols) > 0:
+                processed_raw_data = np.column_stack(proc_cols)
+                baseline_traces = np.column_stack(base_cols)
+
+            def _minus_dff_at_event(raw_proc_arr, baseline_arr, peak_idx, spike_type):
+                p0 = int(peak_idx)
+                n = int(raw_proc_arr.size)
+                win_ms = _stats_window_ms(spike_type)
+                half = max(2, int(round((win_ms * 0.25 / 1000.0) * fs_save)))
+                s0 = max(0, p0 - half)
+                e0 = min(n, p0 + half + 1)
+                if e0 <= s0:
+                    return np.nan
+                local = np.asarray(raw_proc_arr[s0:e0]).copy()
+                valid_here = ~data['results'][0]['recording_exclusion_mask'][s0:e0]
+                local[~valid_here] = np.nan
+                if not np.any(np.isfinite(local)):
+                    return np.nan
+                if bool(params.get('NEGATIVE_GOING', True)):
+                    pk = int(s0 + np.nanargmin(local))
+                else:
+                    pk = int(s0 + np.nanargmax(local))
+                f0 = float(baseline_arr[pk]) if 0 <= pk < baseline_arr.size else np.nan
+                if (not np.isfinite(f0)) or abs(f0) <= 1e-12:
+                    return np.nan
+                dff = 100.0 * (float(raw_proc_arr[pk]) - f0) / abs(f0)
+                return float(-dff if bool(params.get('NEGATIVE_GOING', True)) else dff)
+
+            def _event_waveforms_minus_dff(raw_proc_arr, baseline_arr, peaks, spike_type):
+                out = []
+                half = int(round((_stats_window_ms(spike_type) / 2.0 / 1000.0) * fs_save))
+                if half < 2:
+                    return np.array([], dtype=object)
+                for pp in np.asarray(peaks, dtype=int).ravel():
+                    s0 = int(pp) - half
+                    e0 = int(pp) + half
+                    if s0 < 0 or e0 > raw_proc_arr.size or np.any(data['results'][0]['recording_exclusion_mask'][s0:e0]):
+                        continue
+                    denom = np.where(np.abs(baseline_arr[s0:e0]) > 1e-12, np.abs(baseline_arr[s0:e0]), np.nan)
+                    w = 100.0 * (raw_proc_arr[s0:e0] - baseline_arr[s0:e0]) / denom
+                    if bool(params.get('NEGATIVE_GOING', True)):
+                        w = -w
+                    out.append(np.asarray(w, dtype=float))
+                return np.array(out, dtype=object)
+
+            for cell_i, r in enumerate(res_list):
+                if r is None:
+                    event_snr_cs.append(np.array([], dtype=float))
+                    event_snr_ss.append(np.array([], dtype=float))
+                    event_fwhm_cs.append(np.array([], dtype=float))
+                    event_fwhm_ss.append(np.array([], dtype=float))
+                    event_minus_dff_percent_cs.append(np.array([], dtype=float))
+                    event_minus_dff_percent_ss.append(np.array([], dtype=float))
+                    event_waveforms_minus_dff_percent_cs.append(np.array([], dtype=object))
+                    event_waveforms_minus_dff_percent_ss.append(np.array([], dtype=object))
+                    continue
+                trace_stats = self._get_waveform_source_trace_for_stats(data, cell_i)
+                if trace_stats is None:
+                    trace_stats = np.asarray(r.get('detrended', np.zeros(n_samples)), dtype=float)
+                cs_peaks_i = np.asarray(r.get('cs_peaks', []), dtype=int)
+                ss_peaks_i = np.asarray(r.get('ss_peaks', []), dtype=int)
+                try:
+                    cs_snr_i = np.asarray(compute_event_snrs(r, 'CS', fs_save, window_ms=_stats_window_ms('CS'), max_per_cell=None, trace_override=trace_stats), dtype=float)
+                except Exception:
+                    cs_snr_i = np.array([], dtype=float)
+                try:
+                    ss_snr_i = np.asarray(compute_event_snrs(r, 'SS', fs_save, window_ms=_stats_window_ms('SS'), max_per_cell=None, trace_override=trace_stats), dtype=float)
+                except Exception:
+                    ss_snr_i = np.array([], dtype=float)
+                cs_fwhm_i = np.asarray([row['fwhm_ms'] for row in r.get('event_widths_cs', [])], dtype=float)
+                ss_fwhm_i = np.asarray([row['fwhm_ms'] for row in r.get('event_widths_ss', [])], dtype=float)
+                if len(cs_snr_i) != len(cs_peaks_i) or len(ss_snr_i) != len(ss_peaks_i):
+                    raise ValueError('Event SNR export does not match the labelled/detected event count.')
+                raw_proc_i = processed_raw_data[:, cell_i] if processed_raw_data.ndim == 2 and cell_i < processed_raw_data.shape[1] else np.asarray(raw_data[:, cell_i], dtype=float)
+                base_i = baseline_traces[:, cell_i] if baseline_traces.ndim == 2 and cell_i < baseline_traces.shape[1] else np.zeros_like(raw_proc_i)
+                event_snr_cs.append(cs_snr_i)
+                event_snr_ss.append(ss_snr_i)
+                event_fwhm_cs.append(cs_fwhm_i)
+                event_fwhm_ss.append(ss_fwhm_i)
+                event_minus_dff_percent_cs.append(np.asarray([_minus_dff_at_event(raw_proc_i, base_i, pp, 'CS') for pp in cs_peaks_i], dtype=float))
+                event_minus_dff_percent_ss.append(np.asarray([_minus_dff_at_event(raw_proc_i, base_i, pp, 'SS') for pp in ss_peaks_i], dtype=float))
+                event_waveforms_minus_dff_percent_cs.append(_event_waveforms_minus_dff(raw_proc_i, base_i, cs_peaks_i, 'CS'))
+                event_waveforms_minus_dff_percent_ss.append(_event_waveforms_minus_dff(raw_proc_i, base_i, ss_peaks_i, 'SS'))
+        else:
+            cs_traces = np.array([])
+            ss_traces = np.array([])
+            raw_sigmas = np.array([])
+
+
+        analysis_settings = {
+            'app_version': APP_VERSION,
+            'detection_method': data.get('result_method', params.get('DETECTION_METHOD', 'Threshold')),
+            'combo_detection': bool(params.get('COMBO_DETECTION', False)),
+            'template_whitening_cells': [res.get('template_whitening') for res in data['results']],
+            'combo_cells': [res.get('combo') for res in data['results']] if params.get('COMBO_DETECTION') else [],
+            'timestamp_convention': 'input time_ms, original origin preserved',
+            'input_time_unit': data.get('input_time_unit', 'ms'),
+            'input_warnings': list(data.get('load_warnings', [])),
+            'effective_settings': data.get('effective_settings', {}),
+            'width_policy': 'candidate-centered; uncertain retained with NaN',
+            'observation_policy': 'initial/final blanks excluded before preprocessing, detection and analysis; analysis_valid_mask is authoritative; raw_data retains original excluded samples for viewing',
+            'ss_mask_policy': 'pre/post exclusion without signal zeroing; template support also excluded',
+            'baseline_params': dict(baseline_params),
+            'frame_processing_mode': frame_mode_save,
+            'avg_frames': int(avg_frames_save),
+            'negative_going': bool(params.get('NEGATIVE_GOING', True)),
+            'params': dict(params),
+            'stats_windows_ms': {'CS': _stats_window_ms('CS'), 'SS': _stats_window_ms('SS')},
+            'event_snr_policy': dict(EVENT_SNR_POLICY),
+            'event_metric_units': {
+                'event_minus_dff_percent': '-dF/F (%) for negative-going traces',
+                'event_snr': 'amplitude / local MAD sigma, matching Spike Statistics',
+                'event_fwhm_ms': 'FWHM in ms, matching Spike Statistics source traces',
+            },
+        }
+
+        cs_masks = np.column_stack([r['cs_exclusion_mask'] for r in data['results']])
+        ss_masks = np.column_stack([r['ss_exclusion_mask'] for r in data['results']])
+        width_report = [{key: r.get(key, []) for key in
+            ('cs_width_candidates', 'ss_width_candidates', 'event_widths_cs', 'event_widths_ss')}
+            for r in data['results']]
+        width_report = [{key: [{field: (None if isinstance(value, (float, np.floating)) and not np.isfinite(value) else value)
+            for field, value in row.items()} for row in rows] for key, rows in cell.items()} for cell in width_report]
+        runtime_fields = ('det_method', 'threshold_mode', 'negative_going', 'local_baseline',
+            'sigma_cs', 'sigma_ss', 'cs_threshold_used', 'ss_threshold_used',
+            'cs_candidate_diagnostics', 'ss_candidate_diagnostics', 'width_alignment_ms',
+            'template_whitening', 'combo', 'denoise_enabled', 'denoise_meta',
+            'ss_fwhm_filter_removed', 'ss_fwhm_filter_uncertain', 'ss_width_source',
+            'cs_detection_enabled', 'ss_detection_enabled', 'manual_labels')
+        runtime = [{key: r[key] for key in runtime_fields if key in r} for r in data['results']]
+        extra_traces = {key + 's': np.column_stack([
+            r.get(key, np.full(n_samples, np.nan)) for r in data['results']])
+            for key in ('cs_similarity_trace', 'ss_similarity_trace', 'cs_threshold_trace', 'ss_threshold_trace')}
+        save_payload = dict(
+                            **extra_traces,
+                            source_session_json=json.dumps(dict(source_session_id=self._annotation_session_id(data), output_basename=output_paths(data, self.master_folder)[0].stem.removesuffix('_analyzed'))),
+                            analysis_valid_mask=~np.asarray(data['results'][0]['recording_exclusion_mask'], dtype=bool),
+                            detection_runtime_json=json.dumps(json_safe(runtime), allow_nan=False),
+                            gui_settings_json=json.dumps(settings),
+                            cs_exclusion_mask=cs_masks, ss_exclusion_mask=ss_masks,
+                            recording_duration_s=len(time_ms)/fs_save,
+                            analysis_duration_s=float(np.sum(~data['results'][0]['recording_exclusion_mask'])/fs_save),
+                            valid_duration_cs_s=np.sum(~cs_masks, axis=0)/fs_save,
+                            valid_duration_ss_s=np.sum(~ss_masks, axis=0)/fs_save,
+                            width_quality_json=json.dumps(width_report, allow_nan=False),
+                            spike_qc_json=json.dumps([r.get('spike_qc', {}) for r in data['results']], allow_nan=False),
+                            time_ms=time_ms,
+                            raw_data=raw_data,
+                            processed_raw_data=processed_raw_data,
+                            baseline_traces=baseline_traces,
+                            cs_traces=cs_traces,
+                            ss_traces=ss_traces,
+                            spike_times_cs=np.array(data.get('spike_times_cs', []), dtype=object),
+                            spike_times_ss=np.array(data.get('spike_times_ss', []), dtype=object),
+                            cell_names=np.array(data.get('cell_names', [])),
+                            fs=fs_save,
+                            raw_sigmas=raw_sigmas,
+                            event_snr_cs=np.array(event_snr_cs, dtype=object),
+                            event_snr_ss=np.array(event_snr_ss, dtype=object),
+                            event_fwhm_cs=np.array(event_fwhm_cs, dtype=object),
+                            event_fwhm_ss=np.array(event_fwhm_ss, dtype=object),
+                            event_minus_dff_percent_cs=np.array(event_minus_dff_percent_cs, dtype=object),
+                            event_minus_dff_percent_ss=np.array(event_minus_dff_percent_ss, dtype=object),
+                            event_waveforms_minus_dff_percent_cs=np.array(event_waveforms_minus_dff_percent_cs, dtype=object),
+                            event_waveforms_minus_dff_percent_ss=np.array(event_waveforms_minus_dff_percent_ss, dtype=object),
+                            analysis_settings_json=json.dumps(analysis_settings),
+                            baseline_params_json=json.dumps(dict(baseline_params)),
+                            detection_params_json=json.dumps(dict(params)))
+        return save_payload
+
     def open_detection_viewer(self):
         # prefer using currently selected session data from loaded_sessions
         data = None
@@ -4028,6 +4292,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Clear loaded data and UI
         try:
             self.loaded_sessions = {}
+            self._template_records.clear(); self._label_drafts.clear()
+            self.template_selection_active = False
+            self._reset_template_selection_button_text()
             self._denoise_cache = {}
             self.batch_folders = []
             self.batch_load_issues = []
@@ -4060,6 +4327,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 'SS_BLANK_MS': 18.0,
                 'SS_MAX_FWHM_MS': 4.5,
                 'INITIAL_BLANK_MS': 150.0,
+                'FINAL_BLANK_MS': 50.0,
                 'CS_FILTER_ORDER': 4,
                 'SS_FILTER_ORDER': 4,
                 'FRAME_PROCESSING_MODE': 'Rolling average',
@@ -4102,11 +4370,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 'RAW_SCALE_BAR_UNIT': 'Sigma',
                 'STATS_CS_BG_ALPHA': 0.3,
                 'STATS_SS_BG_ALPHA': 0.003,
-                'DETECTION_VIEW_WINDOW_MS': 500.0,
+                'DETECTION_VIEW_WINDOW_MS': 1000.0,
                 'DETECTION_VIEW_Y_RANGE': 0.0,
-                'DETECTION_VIEW_CENTER': 200,
+                'DETECTION_VIEW_CENTER': 0,
+                'DETECTION_VIEW_AUTO_START': True,
                 'SLIDER_VIEW_Y_RANGE': 0.0,
-                'SLIDER_VIEW_CENTER': 200,
+                'SLIDER_VIEW_CENTER': 0,
+                'SLIDER_VIEW_AUTO_START': True,
                 'DENOISE_SHOW_ADVANCED': False,
             }
             self._sync_polarity_buttons()
@@ -4127,6 +4397,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 'percentile': 20.0,
             }
             self.combo_baseline_method.setCurrentText(self.baseline_params['method'])
+            self.slider_time.setValue(0)
+            self.spin_window.setValue(1000.0)
+            self._main_view_auto_start = True
             self.spin_baseline_window.setValue(self.baseline_params['window_ms'])
             self.spin_baseline_percentile.setValue(self.baseline_params['percentile'])
             # reset detection UI controls
@@ -4189,6 +4462,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.master_folder:
             QMessageBox.warning(self, 'No folder', 'Please select a master folder first.')
             return
+        self._main_view_auto_start = True
         self.batch_folders = []
         self.batch_load_issues = []
         self._denoise_cache.clear()
@@ -4316,10 +4590,14 @@ class MainWindow(QtWidgets.QMainWindow):
         txt += f"Cell: {data['cell_names'][idx]}\n"
         txt += f"Input time unit: {data.get('input_time_unit', 'ms')} (automatic)\n"
         txt += f"Duration: {duration_s:.2f} s\n"
+        observed = data.get('analysis_valid_mask', observation_mask(len(t), fs, self.params))
+        txt += f"Observed for analysis: {np.sum(observed)/fs:.3f} s (recording boundary blanks excluded)\n"
         txt += f"Samples: {n_samples}\n"
         for warning in data.get('load_warnings', []):
             txt += f"Input warning: {warning}\n"
         txt += f"Fs: {fs:.0f} Hz"
+        if self.template_selection_active and self.template_selection_type == 'LABEL':
+            txt += '\nManual label measurements use the preprocessing snapshot captured for this session at entry.'
         if data.get('loaded_detection_result'):
             txt += '\nSaved detection loaded; displaying recorded preprocessing. Edited settings apply to a new detection.'
             txt += f"\nResults: {data['results_file']}"
@@ -4352,6 +4630,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def on_slider_time_changed(self):
+        self._main_view_auto_start = False
         self.slider_position = self.slider_time.value() / 1000.0
         self.update_plot()
 
@@ -4388,26 +4667,13 @@ class MainWindow(QtWidgets.QMainWindow):
         frames = int(self.spin_avg_frames.value()) if hasattr(self, 'spin_avg_frames') else 0
         saved_view = bool(data.get('loaded_detection_result'))
         if saved_view:
-            raw_proc = np.asarray(data['processed_raw_data'][:, idx])
+            raw_proc = _display_processed_raw(data, idx)
             baseline = np.asarray(data['baseline_traces'][:, idx])
         else:
-            raw_proc = apply_frame_processing(raw, frames=frames, mode=self._get_frame_processing_mode())
-            baseline = self.compute_baseline(raw_proc, fs)
-        # Sliding window using center slider + window size
-        t_min, t_max = t[0], t[-1]
-        center_pct = float(self.slider_time.value()) / 1000.0 if hasattr(self, 'slider_time') else 0.0
-        total_ms = t_max - t_min
-        center_time = t_min + center_pct * total_ms
-        window_ms = float(self.spin_window.value()) if hasattr(self, 'spin_window') else (500.0)
-        start_time = center_time - window_ms / 2.0
-        end_time = center_time + window_ms / 2.0
-        # Clamp to valid range
-        if start_time < t_min:
-            start_time = t_min
-            end_time = min(t_min + window_ms, t_max)
-        if end_time > t_max:
-            end_time = t_max
-            start_time = max(t_min, t_max - window_ms)
+            raw_proc, baseline, _ = protected_preprocess(raw, fs, self.params, self.baseline_params, frames, self._get_frame_processing_mode())
+        # Use the first observed timestamp until the user explicitly navigates.
+        start_time, end_time = _trace_view_window(data, data.get('_saved_detection_params', self.params),
+            float(self.spin_window.value()), self.slider_time.value(), self._main_view_auto_start)
         mask = (t >= start_time) & (t <= end_time)
         # Plot: either raw + baseline OR baseline-corrected (replace raw)
         # If baseline method is 'Disable', do not apply or show baseline correction
@@ -4453,7 +4719,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # If CS filter visualization is requested
         if getattr(self, 'chk_show_cs', None) and self.chk_show_cs.isChecked():
             try:
-                cs_vis = (data['results'][idx]['cs_trace'] * (-1 if data['results'][idx]['negative_going'] else 1) if saved_view else apply_filter(vis_source, fs, low=float(self.spin_cs_low.value()), high=float(self.spin_cs_high.value()), order=int(self.spin_cs_order.value())))
+                cs_vis = (data['results'][idx]['cs_trace'] * (-1 if data['results'][idx]['negative_going'] else 1) if saved_view else protected_filter(vis_source, fs, self.params, low=float(self.spin_cs_low.value()), high=float(self.spin_cs_high.value()), order=int(self.spin_cs_order.value())))
                 vis_for_ylim = cs_vis
                 plot_color = color_main if color_main is not None else self.colors.get('baseline', '#FFC20A')
                 ax.plot(t[mask], cs_vis[mask], color=plot_color, lw=_get_linewidth(1.2), label='CS filter')
@@ -4465,7 +4731,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # If SS filter visualization is requested
         elif getattr(self, 'chk_show_ss', None) and self.chk_show_ss.isChecked():
             try:
-                ss_vis = (data['results'][idx]['ss_trace'] * (-1 if data['results'][idx]['negative_going'] else 1) if saved_view else apply_filter(vis_source, fs, low=float(self.spin_ss_low.value()), high=float(self.spin_ss_high.value()), order=int(self.spin_ss_order.value())))
+                ss_vis = (data['results'][idx]['ss_trace'] * (-1 if data['results'][idx]['negative_going'] else 1) if saved_view else protected_filter(vis_source, fs, self.params, low=float(self.spin_ss_low.value()), high=float(self.spin_ss_high.value()), order=int(self.spin_ss_order.value())))
                 vis_for_ylim = ss_vis
                 plot_color = color_main if color_main is not None else '#2ca02c'
                 ax.plot(t[mask], ss_vis[mask], color=plot_color, lw=_get_linewidth(1.2), label='SS filter')
@@ -4505,7 +4771,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Draw shaded selected template intervals (current type)
         try:
             for tp, col in [('CS', '#009E73'), ('SS', '#D55E00')]:
-                intervals = self.template_selected_intervals_ms.get(tp, []) if hasattr(self, 'template_selected_intervals_ms') else []
+                intervals = [(r['start_ms'], r['end_ms']) for r in self._template_records if r['kind'] == tp and r['session_id'] == self._annotation_session_id() and r['cell'] == idx]
                 for s_ms, e_ms in intervals:
                     if e_ms < start_time or s_ms > end_time:
                         continue
@@ -4514,6 +4780,33 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         ax.set_xlabel('Time (ms)')
         ax.set_ylabel('Signal')
+        if ((self.template_selection_active and self.template_selection_type == 'LABEL') or
+                (data.get('is_manual_labels') and not self.template_selection_active)):
+            try:
+                draft = (self._label_draft() if self.template_selection_active else dict(
+                    settings=data['_saved_settings_snapshot'], events=[{kind: r[kind.lower()+'_peaks'].tolist()
+                        for kind in ('CS','SS')} for r in data['results']]))
+            except (ValueError, OSError) as exc:
+                draft = None
+                self.statusBar().showMessage(str(exc))
+            if draft is None:
+                self.canvas.draw()
+                return
+            negative = bool(draft['settings']['params'].get('NEGATIVE_GOING', True))
+            rail = .96 if not negative else .04
+            for kind, color in (('CS', self.colors.get('cs_trace', '#009E73')), ('SS', self.colors.get('ss_trace', '#D55E00'))):
+                points = draft['events'][idx][kind]
+                for peak in points:
+                    if start_time <= t[peak] <= end_time:
+                        ax.plot([t[peak]], [rail], marker='_' if kind == 'CS' else '|', ls='None',
+                            markersize=12, markeredgewidth=2, color=color, transform=ax.get_xaxis_transform(), gid='manual_'+kind.lower())
+        valid_recording = (observation_mask(len(t), fs, draft['settings']['params']) if self.template_selection_active and self.template_selection_type == 'LABEL' else
+                           data.get('analysis_valid_mask') if saved_view else observation_mask(len(t), fs, self.params))
+        if valid_recording is not None:
+            for left, right in recording_intervals_ms(t, fs, np.asarray(valid_recording, bool)):
+                if right >= start_time and left <= end_time:
+                    ax.axvspan(left, right, color='#888888', alpha=.12, lw=0, gid='boundary_blank')
+
         # tidy legend (no frame) unless user requested simplified black view
         try:
             if not any_vis_override:
@@ -4531,8 +4824,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Y-Range semantics: if spin_zoom (Y-Range) > 0, center plot on trace and show that full range.
         # If 0 => auto-scale with padding.
         y_range = float(self.spin_zoom.value()) if hasattr(self, 'spin_zoom') else 0.0
+        scale_mask = mask & np.asarray(valid_recording, bool) if valid_recording is not None else mask
+        if not np.any(scale_mask):
+            scale_mask = mask
         if np.any(mask):
-            v = vis_for_ylim[mask]
+            v = vis_for_ylim[scale_mask]
             vmin = np.min(v); vmax = np.max(v)
             span = vmax - vmin
             local_std = np.std(v) if len(v) > 0 else 1.0
@@ -4799,8 +5095,14 @@ class SliderViewerDialog(QtWidgets.QDialog):
         self.slider_time.setMinimum(0)
         self.slider_time.setMaximum(1000)
         view_params = getattr(parent, 'params', {})
-        self.slider_time.setValue(int(view_params.get('SLIDER_VIEW_CENTER', 200)))
-        self.slider_time.valueChanged.connect(self.update_plot)
+        self._auto_start_view = bool(view_params.get('SLIDER_VIEW_AUTO_START', 'SLIDER_VIEW_CENTER' not in view_params))
+        self.slider_time.setValue(int(view_params.get('SLIDER_VIEW_CENTER', 0)))
+        def navigate(value):
+            self._auto_start_view = False
+            if parent is not None:
+                parent.params['SLIDER_VIEW_AUTO_START'] = False
+            self.update_plot()
+        self.slider_time.valueChanged.connect(navigate)
 
         self.spin_zoom = QtWidgets.QDoubleSpinBox(); self.spin_zoom.setRange(0.0, 1e6); self.spin_zoom.setValue(float(view_params.get('SLIDER_VIEW_Y_RANGE', 0.0)))
         self.spin_zoom.valueChanged.connect(self.update_plot)
@@ -4833,13 +5135,11 @@ class SliderViewerDialog(QtWidgets.QDialog):
         t = self.data['time_ms']
         raw = self.data['raw_data'][:, self.cell_idx]
         fs = float(self.data['fs'])
-        center_pct = self.slider_time.value() / 1000.0
-        n = len(t)
-        win_ms = 500.0
-        total_ms = t[-1] - t[0]
-        center_time = t[0] + center_pct * total_ms
-        start_time = center_time - win_ms/2.0
-        mask = (t >= start_time) & (t <= center_time + win_ms/2.0)
+        parent = self.parent()
+        params = self.data.get('_saved_detection_params', getattr(parent, 'params', {}))
+        start_time, end_time = _trace_view_window(self.data, params, 1000.0,
+            self.slider_time.value(), self._auto_start_view)
+        mask = (t >= start_time) & (t <= end_time)
         # update start time label
         try:
             self.lbl_start_time.setText(f'Start: {int(start_time)} ms')
@@ -4856,48 +5156,13 @@ class SliderViewerDialog(QtWidgets.QDialog):
         frames = int(parent.spin_avg_frames.value()) if (parent is not None and hasattr(parent, 'spin_avg_frames')) else 0
         mode = parent._get_frame_processing_mode() if (parent is not None and hasattr(parent, '_get_frame_processing_mode')) else 'Rolling average'
         if self.data.get('loaded_detection_result'):
-            raw_viz = self.data['processed_raw_data'][:, self.cell_idx]
+            raw_viz = _display_processed_raw(self.data, self.cell_idx)
             baseline_gui = self.data['baseline_traces'][:, self.cell_idx]
             det = self.data['results'][self.cell_idx]
         else:
-            raw_viz = apply_frame_processing(raw, frames=frames, mode=mode)
-
-            # compute baseline using GUI baseline settings (after averaging)
-            baseline_gui = parent.compute_baseline(raw_viz, fs) if (parent is not None and hasattr(parent, 'compute_baseline')) else np.zeros_like(raw_viz)
-            detrended_gui = raw_viz - baseline_gui
-            detrended_for_ss = detrended_gui
-            detrended_for_cs = detrended_gui
-            if parent is not None and hasattr(parent, '_apply_denoise_trace') and bool(params.get('DENOISE_ENABLED', False)):
-                try:
-                    cache_key = ('detection_preview', id(self.data), int(self.cell_idx))
-                    denoised_gui, _ = parent._apply_denoise_trace(detrended_gui, fs, cache_key=cache_key)
-                    detrended_for_ss = denoised_gui
-                    if bool(params.get('DENOISE_APPLY_TO_CS', False)):
-                        detrended_for_cs = denoised_gui
-                except Exception:
-                    pass
-            pre_detr_viz = detrended_gui * (-1.0 if params.get('NEGATIVE_GOING', True) else 1.0)
-            pre_detr_cs = detrended_for_cs * (-1.0 if params.get('NEGATIVE_GOING', True) else 1.0)
-            pre_detr_ss = detrended_for_ss * (-1.0 if params.get('NEGATIVE_GOING', True) else 1.0)
-            det = process_cell_simple(raw_viz, fs,
-                      negative_going=params.get('NEGATIVE_GOING', True),
-                      cs_low_cut=params.get('CS_LOW_CUT_HZ', 0.0),
-                      cs_high_cut=params.get('CS_HIGH_CUT_HZ', 150.0),
-                      cs_thresh_sigma=params.get('CS_THRESHOLD_SIGMA', 6.0),
-                      cs_min_dist_ms=params.get('CS_MIN_DIST_MS', 25.0),
-                      cs_min_fwhm_ms=params.get('CS_MIN_FWHM_MS', 4.0),
-                      ss_low_cut=params.get('SS_LOW_CUT_HZ', 0.0),
-                      ss_high_cut=params.get('SS_HIGH_CUT_HZ', 0.0),
-                      ss_thresh_sigma=params.get('SS_THRESHOLD_SIGMA', 2.5),
-                      ss_min_dist_ms=params.get('SS_MIN_DIST_MS', 4.0),
-                      ss_blank_ms=params.get('SS_BLANK_MS', 18.0),
-                      ss_mask_pre_ms=mask_windows(params)[0], ss_mask_post_ms=mask_windows(params)[1],
-                      use_preprocessed=True, pre_detrended=pre_detr_viz,
-                      pre_detrended_cs=pre_detr_cs, pre_detrended_ss=pre_detr_ss,
-                      pre_baseline=baseline_gui,
-                      local_baseline=bool(params.get('LOCAL_BASELINE', False)),
-                      local_baseline_cs_ms=float(params.get('LOCAL_BASELINE_CS_MS', 200.0)),
-                      local_baseline_ss_ms=float(params.get('LOCAL_BASELINE_SS_MS', 50.0)))
+            raw_viz, baseline_gui, _ = protected_preprocess(raw, fs, params, parent.baseline_params, frames, mode)
+            det = _detect_cell(raw, fs, params, parent.baseline_params, frames, mode,
+                              parent.template_store, parent._get_denoise_config())
 
         # baseline_display should be the baseline estimated for the raw (after averaging).
         # Use the GUI baseline (computed above) or the one returned by detection if present.
@@ -4929,7 +5194,7 @@ class SliderViewerDialog(QtWidgets.QDialog):
         self.ax_raw.plot(cs_times, [np.max(vis_signal)] * len(cs_times), 'x', color=colors.get('cs_trace', '#009E73'))
         self.ax_raw.plot(ss_times, [np.min(vis_signal)] * len(ss_times), '|', color=colors.get('ss_trace', '#D55E00'))
 
-        self.ax_raw.set_xlim(center_time - win_ms/2.0, center_time + win_ms/2.0)
+        self.ax_raw.set_xlim(start_time, end_time)
         if np.any(mask):
             v_lim = vis_signal[mask]
             self.ax_raw.set_ylim(np.min(v_lim) - 0.1*np.ptp(v_lim), np.max(v_lim) + 0.1*np.ptp(v_lim))
@@ -5023,10 +5288,16 @@ class DetectionViewerDialog(QtWidgets.QDialog):
         self.slider_time.setMinimum(0)
         self.slider_time.setMaximum(1000)
         view_params = getattr(parent, 'params', {})
-        self.slider_time.setValue(int(view_params.get('DETECTION_VIEW_CENTER', 200)))
-        self.slider_time.valueChanged.connect(self.plot_detection)
+        self._auto_start_view = bool(view_params.get('DETECTION_VIEW_AUTO_START', 'DETECTION_VIEW_CENTER' not in view_params))
+        self.slider_time.setValue(int(view_params.get('DETECTION_VIEW_CENTER', 0)))
+        def navigate(value):
+            self._auto_start_view = False
+            if parent is not None:
+                parent.params['DETECTION_VIEW_AUTO_START'] = False
+            self.plot_detection()
+        self.slider_time.valueChanged.connect(navigate)
 
-        self.spin_window = QtWidgets.QDoubleSpinBox(); self.spin_window.setRange(10.0, 10000.0); self.spin_window.setValue(float(view_params.get('DETECTION_VIEW_WINDOW_MS', 500.0)))
+        self.spin_window = QtWidgets.QDoubleSpinBox(); self.spin_window.setRange(10.0, 10000.0); self.spin_window.setValue(float(view_params.get('DETECTION_VIEW_WINDOW_MS', 1000.0)))
         self.spin_window.valueChanged.connect(self.plot_detection)
         self.spin_zoom = QtWidgets.QDoubleSpinBox(); self.spin_zoom.setRange(0.0, 1e6); self.spin_zoom.setValue(float(view_params.get('DETECTION_VIEW_Y_RANGE', 0.0)))
         self.spin_zoom.valueChanged.connect(self.plot_detection)
@@ -5309,13 +5580,8 @@ class DetectionViewerDialog(QtWidgets.QDialog):
         colors = parent.colors if parent is not None else {'raw':'#333333','baseline':'#FFC20A','cs_trace':'#009E73','ss_trace':'#D55E00','cs_thresh':'#56B4E9','ss_thresh':'#CC79A7'}
         params = self.data.get('_saved_detection_params', parent.params if parent is not None else {})
 
-        # compute window
-        center_pct = self.slider_time.value() / 1000.0
-        total_ms = t[-1] - t[0]
-        center_time = t[0] + center_pct * total_ms
-        win_ms = float(self.spin_window.value())
-        window_start = center_time - win_ms/2.0
-        window_end = center_time + win_ms/2.0
+        window_start, window_end = _trace_view_window(self.data, params, float(self.spin_window.value()),
+            self.slider_time.value(), self._auto_start_view)
         mask = (t >= window_start) & (t <= window_end)
         try:
             self.lbl_start_time.setText(f'Start: {int(window_start)} ms')
@@ -5325,11 +5591,10 @@ class DetectionViewerDialog(QtWidgets.QDialog):
         frames = int(parent.spin_avg_frames.value()) if (parent is not None and hasattr(parent, 'spin_avg_frames')) else 0
         mode = parent._get_frame_processing_mode() if (parent is not None and hasattr(parent, '_get_frame_processing_mode')) else 'Rolling average'
         if self.data.get('loaded_detection_result'):
-            raw_proc = np.asarray(self.data['processed_raw_data'][:, self.cell_idx])
+            raw_proc = _display_processed_raw(self.data, self.cell_idx)
             baseline_gui = np.asarray(self.data['baseline_traces'][:, self.cell_idx])
         else:
-            raw_proc = apply_frame_processing(raw, frames=frames, mode=mode)
-            baseline_gui = parent.compute_baseline(raw_proc, fs) if (parent is not None and hasattr(parent, 'compute_baseline')) else np.zeros_like(raw_proc)
+            raw_proc, baseline_gui, _ = protected_preprocess(raw, fs, params, parent.baseline_params, frames, mode)
         vis_raw = np.asarray(raw_proc, dtype=float)
 
         for a in [self.ax_raw_top, self.ax_cs, self.ax_ss, self.ax_raw_bot]:
@@ -5350,7 +5615,9 @@ class DetectionViewerDialog(QtWidgets.QDialog):
             messages = []
             for spike_type in ('CS', 'SS'):
                 info = res.get(f'{spike_type.lower()}_candidate_diagnostics', {})
-                if info.get('unavailable'):
+                if info.get('manual'):
+                    messages.append(f'{spike_type}: manual labels {len(res[spike_type.lower()+"_peaks"])}; width/SNR measured without automatic rejection')
+                elif info.get('unavailable'):
                     messages.append(f'{spike_type}: saved candidate diagnostics unavailable; kept {len(res[spike_type.lower()+"_peaks"])}')
                 elif info.get('no_templates'):
                     messages.append(f'{spike_type}: ' + ('no templates available' if res.get('combo') else 'no templates loaded'))
@@ -5411,7 +5678,7 @@ class DetectionViewerDialog(QtWidgets.QDialog):
                 self.ax_cs.axhline(cs_thr_line, color=colors.get('cs_thresh', '#56B4E9'), ls='--')
             if np.isfinite(ss_thr_line):
                 self.ax_ss.axhline(ss_thr_line, color=colors.get('ss_thresh', '#CC79A7'), ls='--')
-        elif not is_template_mode and not res.get('loaded_local_threshold_unavailable'):
+        elif not is_template_mode and not res.get('manual_labels') and not res.get('loaded_local_threshold_unavailable'):
             if res.get('local_baseline', False) and 'cs_threshold_trace' in res:
                 self.ax_cs.plot(t[mask], np.asarray(res['cs_threshold_trace'])[mask], color=colors.get('cs_thresh', '#56B4E9'), ls='--')
             else:
@@ -5430,11 +5697,14 @@ class DetectionViewerDialog(QtWidgets.QDialog):
             a.set_xlim(window_start, window_end)
 
         y_range = float(self.spin_zoom.value()) if hasattr(self, 'spin_zoom') else 0.0
+        scale_mask = mask & ~np.asarray(res.get('recording_exclusion_mask', np.zeros(len(t), bool)), bool)
+        if not np.any(scale_mask):
+            scale_mask = mask
         if np.any(mask):
-            center = 0.5 * (np.max(vis_top[mask]) + np.min(vis_top[mask]))
-            vmin = np.min(vis_top[mask]); vmax = np.max(vis_top[mask])
+            center = 0.5 * (np.max(vis_top[scale_mask]) + np.min(vis_top[scale_mask]))
+            vmin = np.min(vis_top[scale_mask]); vmax = np.max(vis_top[scale_mask])
             span = vmax - vmin
-            local_std = np.std(vis_top[mask]) if len(vis_top[mask])>0 else 1.0
+            local_std = np.std(vis_top[scale_mask]) if np.any(scale_mask) else 1.0
             if y_range <= 0.0:
                 pad = max(span * 0.12, local_std * 0.5, 1e-9)
                 ylim = (vmin - pad, vmax + pad)
@@ -5453,8 +5723,8 @@ class DetectionViewerDialog(QtWidgets.QDialog):
 
         raw_span_original = max(1e-9, span if 'span' in locals() else 1.0)
         factor = float(y_range) / raw_span_original if y_range > 0.0 else 1.0
-        cs_masked = cs_plot_trace[mask] if np.any(mask) else np.array([])
-        ss_masked = ss_plot_trace[mask] if np.any(mask) else np.array([])
+        cs_masked = cs_plot_trace[scale_mask] if np.any(scale_mask) else np.array([])
+        ss_masked = ss_plot_trace[scale_mask] if np.any(scale_mask) else np.array([])
         cs_std = np.std(cs_masked) if cs_masked.size > 0 else 1.0
         ss_std = np.std(ss_masked) if ss_masked.size > 0 else 1.0
         if is_template_mode:
@@ -5523,7 +5793,7 @@ class DetectionViewerDialog(QtWidgets.QDialog):
             vis_ms,
             ylim,
             res.get('raw_sigma', 1.0),
-            baseline_value=float(np.nanmedian(np.asarray(baseline_display)[mask])) if np.any(mask) else None,
+            baseline_value=float(np.nanmedian(np.asarray(baseline_display)[mask & ~res.get('recording_exclusion_mask', np.zeros(len(t), bool))])) if np.any(mask & ~res.get('recording_exclusion_mask', np.zeros(len(t), bool))) else None,
         )
 
         self.canvas.draw()
@@ -5542,7 +5812,7 @@ class DetectionViewerDialog(QtWidgets.QDialog):
             if s < 0 or e > arr.size:
                 continue
             w = arr[s:e]
-            if w.size == 2 * half_win:
+            if w.size == 2 * half_win and np.all(np.isfinite(w)):
                 waves.append(w)
         if len(waves) == 0:
             return np.array([])
@@ -5550,21 +5820,12 @@ class DetectionViewerDialog(QtWidgets.QDialog):
 
     def _preprocess_for_template_export(self, raw, fs):
         parent = self.parent()
-        sig = np.asarray(raw, dtype=float)
-        frames = int(parent.spin_avg_frames.value()) if (parent is not None and hasattr(parent, 'spin_avg_frames')) else 0
-        mode = parent._get_frame_processing_mode() if (parent is not None and hasattr(parent, '_get_frame_processing_mode')) else 'Rolling average'
-        sig = apply_frame_processing(sig, frames=frames, mode=mode)
-        try:
-            baseline = parent.compute_baseline(sig, fs) if (parent is not None and hasattr(parent, 'compute_baseline')) else np.zeros_like(sig)
-        except Exception:
-            baseline = np.zeros_like(sig)
-        sig = sig - baseline
-        try:
-            if parent is not None and bool(parent.params.get('NEGATIVE_GOING', True)):
-                sig = -sig
-        except Exception:
-            pass
-        return np.asarray(sig, dtype=float)
+        frames = int(parent.spin_avg_frames.value())
+        processed, baseline, valid = protected_preprocess(raw, fs, parent.params,
+            parent.baseline_params, frames, parent._get_frame_processing_mode())
+        sig = (processed-baseline) * (-1 if parent.params.get('NEGATIVE_GOING', True) else 1)
+        sig[~valid] = np.nan
+        return sig
 
     def export_detected_templates(self):
         try:
@@ -6124,6 +6385,9 @@ class StatsViewerDialog(QtWidgets.QDialog):
         rates = {'CS': [], 'SS': []}
         uncertain_counts = {'CS': 0, 'SS': 0}
         valid_seconds = {'CS': 0.0, 'SS': 0.0}
+        items = [(res, data, cell) for res, data, cell in items
+                 if not data.get('is_manual_labels') or cell in data.get('label_metadata', {}).get('labelled_cells', [])]
+        manual_summary = any(data.get('is_manual_labels') for _, data, _ in items)
         for res, sdata, cell_idx in items:
             if res is None or sdata is None:
                 continue
@@ -6159,7 +6423,7 @@ class StatsViewerDialog(QtWidgets.QDialog):
                     all_stats[spike_type]['fwhm'].extend(r['fwhm_ms'] for r in res.get('event_widths_' + spike_type.lower(), []) if np.isfinite(r['fwhm_ms']))
                     valid_seconds[spike_type] += np.sum(~res.get(spike_type.lower() + '_exclusion_mask', np.zeros(len(sdata['time_ms']), dtype=bool))) / fs
                     if duration_s and duration_s > 0:
-                        rates[spike_type].append(len(peaks) / duration_s)
+                        rates[spike_type].append(len(peaks) / (np.sum(~res.get('recording_exclusion_mask', np.zeros(len(sdata['time_ms']), bool)))/fs))
                     try:
                         chosen_for_rate = _select_event_bank(peaks, max_per_cell=None)
                         if chosen_for_rate is not None and len(chosen_for_rate) >= 2:
@@ -6198,6 +6462,8 @@ class StatsViewerDialog(QtWidgets.QDialog):
                             continue
                         wave = trace[s:e]
                         if len(wave) != (2 * half_win):
+                            continue
+                        if not np.all(np.isfinite(wave)):
                             continue
                         if len(wave) > 5:
                             wave = wave - np.mean(wave[:5])
@@ -6447,7 +6713,10 @@ class StatsViewerDialog(QtWidgets.QDialog):
                 txt_lines.append(f"Inst rate: {ss_inst_mean:.2f}±{ss_inst_std:.2f} Hz (n={ss_inst_n})")
             txt_lines.append(f"Uncertain widths: {uncertain_counts[spike_type]}")
             txt_lines.append(f"Valid time: {valid_seconds[spike_type]:.2f} cell-s")
-            txt_lines.append('Rate uses full duration')
+            txt_lines.append('Rate excludes recording boundary blanks')
+            if manual_summary:
+                txt_lines[0] = txt_lines[0].replace('Rate:', 'Label/mixed rate:')
+                txt_lines.append('Manual labels: partial/unverified')
             ax_txt.text(0.02, 0.5, '\n'.join(txt_lines), va='center', ha='left', fontsize=10)
 
         self.canvas.draw()
@@ -6485,6 +6754,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.spin_cs_mind = QtWidgets.QDoubleSpinBox(); self.spin_cs_mind.setRange(0.0,1000.0); self.spin_cs_mind.setValue(p.get('CS_MIN_DIST_MS', 25.0))
         self.spin_ss_mind = QtWidgets.QDoubleSpinBox(); self.spin_ss_mind.setRange(0.0,1000.0); self.spin_ss_mind.setValue(p.get('SS_MIN_DIST_MS', 4.0))
         self.spin_ss_blank = QtWidgets.QDoubleSpinBox(); self.spin_ss_blank.setRange(0.0,1000.0); self.spin_ss_blank.setValue(p.get('SS_BLANK_MS', 18.0))
+        self.spin_final_blank = QtWidgets.QDoubleSpinBox(); self.spin_final_blank.setRange(0.0, 5000.0); self.spin_final_blank.setValue(p.get('FINAL_BLANK_MS', 50.0))
         self.spin_initial_blank = QtWidgets.QDoubleSpinBox(); self.spin_initial_blank.setRange(0.0,5000.0); self.spin_initial_blank.setValue(p.get('INITIAL_BLANK_MS', 150.0))
         self.spin_tpl_cs_window = QtWidgets.QDoubleSpinBox(); self.spin_tpl_cs_window.setRange(1.0,200.0); self.spin_tpl_cs_window.setDecimals(1); self.spin_tpl_cs_window.setValue(p.get('TEMPLATE_CS_WINDOW_MS', 30.0))
         self.spin_tpl_ss_window = QtWidgets.QDoubleSpinBox(); self.spin_tpl_ss_window.setRange(1.0,100.0); self.spin_tpl_ss_window.setDecimals(1); self.spin_tpl_ss_window.setValue(p.get('TEMPLATE_SS_WINDOW_MS', 8.0))
@@ -6507,6 +6777,7 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow('SS exclusion before CS (ms):', self.spin_ss_mask_pre)
         form.addRow('SS exclusion after CS (ms):', self.spin_ss_mask_post)
         form.addRow('Initial blank (ms):', self.spin_initial_blank)
+        form.addRow('Final blank (ms):', self.spin_final_blank)
         form.addRow('Template CS window (ms):', self.spin_tpl_cs_window)
         form.addRow('Template SS window (ms):', self.spin_tpl_ss_window)
         form.addRow('Parallel template PCA components:', self.spin_template_components)
@@ -6588,6 +6859,7 @@ class SettingsDialog(QtWidgets.QDialog):
             self.parent_win.params['SS_MASK_PRE_MS'] = float(self.spin_ss_mask_pre.value())
             self.parent_win.params['SS_MASK_POST_MS'] = float(self.spin_ss_mask_post.value())
             self.parent_win.params['INITIAL_BLANK_MS'] = float(self.spin_initial_blank.value())
+            self.parent_win.params['FINAL_BLANK_MS'] = float(self.spin_final_blank.value())
             self.parent_win.params['TEMPLATE_CS_WINDOW_MS'] = float(self.spin_tpl_cs_window.value())
             self.parent_win.params['TEMPLATE_SS_WINDOW_MS'] = float(self.spin_tpl_ss_window.value())
             components = int(self.spin_template_components.value())

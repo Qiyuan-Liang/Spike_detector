@@ -599,6 +599,7 @@ class ScienceGuiTests(unittest.TestCase):
         trace[101]=2 # supplied candidate is not a local max
         data={'raw_data':trace[:,None],'time_ms':np.arange(200),'cell_names':['c'],'fs':1000}
         self.win.baseline_params['method']='Disable'
+        self.win.params.update(INITIAL_BLANK_MS=0, FINAL_BLANK_MS=0)
         self.win.params['NEGATIVE_GOING']=False
         res={'ss_peaks':np.array([100]),'cs_peaks':np.array([],dtype=int),'cs_width_candidates':[]}
         self.win._apply_ss_fwhm_filter(res,data,0)
@@ -615,6 +616,7 @@ class ScienceGuiTests(unittest.TestCase):
         self.assertEqual(self.win.run_detection_all(), (1, 1))
         result = self.win.data['results'][0]
         result['det_method'] = 'Template Matching (Amplitude-fit LLR)'
+        self.win.params['DETECTION_VIEW_AUTO_START'] = False
         result['cs_peaks'] = np.array([50, 100])
         result['cs_candidate_diagnostics'] = dict(score_peaks=2, masked=0,
             response_rejected=0, peak_rejected=0, refractory_rejected=0)
@@ -654,6 +656,7 @@ class ScienceGuiTests(unittest.TestCase):
         trace=3*np.exp(-.5*((t-60)/.8493)**2)+8*np.exp(-.5*((t-70)/2.1233)**2)
         data={'raw_data':trace[:,None],'time_ms':t,'cell_names':['c'],'fs':10000}
         self.win.baseline_params['method']='Disable'
+        self.win.params.update(INITIAL_BLANK_MS=0, FINAL_BLANK_MS=0)
         self.win.params['NEGATIVE_GOING']=False
         res={'ss_peaks':np.array([600,700]),'cs_peaks':np.array([],dtype=int),'cs_width_candidates':[]}
         self.win._apply_ss_fwhm_filter(res,data,0)

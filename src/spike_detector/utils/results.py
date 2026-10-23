@@ -94,6 +94,8 @@ def output_paths(data, fallback_folder):
     source = Path(data['session_path'])
     folder = Path(data.get('source_folder') or fallback_folder or source.parent)
     base = data.get('output_basename') or source.stem
+    if data.get('loaded_detection_result') and source.suffix.lower() == '.npz' and not data.get('output_basename'):
+        base = base.removesuffix('_analyzed').removesuffix('_labels')
     destination = folder / 'spike_detection' / (base + '_analyzed.npz')
     return destination, [destination, destination.with_suffix('.npy'),
         destination.with_name(destination.stem + '_settings.json')]

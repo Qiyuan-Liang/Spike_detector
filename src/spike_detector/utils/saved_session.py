@@ -5,6 +5,7 @@ import json
 import numpy as np
 from .validation import validate_session
 from .processing import estimate_noise_mad
+from .boundaries import observation_mask
 
 
 def json_safe(value):
@@ -76,6 +77,16 @@ def load_saved_detection(path):
         processed = _matrix(z, 'processed_raw_data', shape)
         baseline = _matrix(z, 'baseline_traces', shape)
         traces = {kind: _matrix(z, kind+'_traces', shape) for kind in ('cs', 'ss')}
+        source = _json(z, 'source_session_json', {})
+        if not isinstance(source, dict):
+            raise ValueError('Invalid source recording metadata.')
+        if source.get('output_basename'):
+            base_name = str(source['output_basename'])
+            if Path(base_name).name != base_name or '/' in base_name or chr(92) in base_name:
+                raise ValueError('Invalid source recording basename.')
+            data['output_basename'] = base_name
+        if source.get('source_session_id'):
+            data['source_session_id'] = str(source['source_session_id'])
         analysis = _json(z, 'analysis_settings_json', {})
         if not isinstance(analysis, dict):
             raise ValueError('Invalid saved analysis settings.')
@@ -123,6 +134,23 @@ def load_saved_detection(path):
         matrices = {key: _matrix(z, key, shape, optional=True) for key in
                     ('cs_exclusion_mask', 'ss_exclusion_mask', 'cs_similarity_traces',
                      'ss_similarity_traces', 'cs_threshold_traces', 'ss_threshold_traces')}
+        if 'analysis_valid_mask' in z:
+            valid = np.asarray(z['analysis_valid_mask'])
+            if valid.shape != (shape[0],) or not np.all(np.isin(valid, [0, 1])):
+                raise ValueError('Invalid recording observation mask.')
+            valid = valid.astype(bool)
+        else:
+            # Legacy archives had no final blank. Do not reinterpret their events.
+            valid = observation_mask(shape[0], data['fs'], dict(params, FINAL_BLANK_MS=params.get('FINAL_BLANK_MS', 0)))
+        if not valid.any() or np.any(np.diff(np.flatnonzero(valid)) != 1):
+            raise ValueError('A saved recording must have one nonempty observed interval.')
+        data['analysis_valid_mask'] = valid
+        label_meta = _json(z, 'label_metadata_json', {})
+        if not isinstance(label_meta, dict):
+            raise ValueError('Invalid manual label metadata.')
+        data['is_manual_labels'] = bool(label_meta) or analysis.get('detection_method') == 'Manual labels'
+        if label_meta:
+            data['label_metadata'] = label_meta
         sign = -1 if params.get('NEGATIVE_GOING', True) else 1
         data['results'] = []
         data['spike_times_cs'], data['spike_times_ss'] = [], []
@@ -139,11 +167,17 @@ def load_saved_detection(path):
             res.update(baseline=baseline[:, cell], detrended=(processed[:, cell]-baseline[:, cell])*sign,
                        stats_source_trace=(processed[:, cell]-baseline[:, cell])*sign,
                        negative_going=bool(params.get('NEGATIVE_GOING', True)))
+            if data['is_manual_labels']:
+                res['manual_reviewed'] = cell in label_meta.get('labelled_cells', [])
+            res['recording_exclusion_mask'] = ~valid
+            res['stats_source_trace'][~valid] = np.nan
             raw_sigmas = np.asarray(z['raw_sigmas'], dtype=float) if 'raw_sigmas' in z else []
             res['raw_sigma'] = float(raw_sigmas[cell]) if len(raw_sigmas) == cells else estimate_noise_mad(res['detrended'])
             for kind in ('cs', 'ss'):
                 times = _cell_values(z, 'spike_times_'+kind, cell, cells)
                 peaks = _indices(times, data['time_ms'], data['fs'])
+                if np.any(~valid[peaks]):
+                    raise ValueError('Saved spikes lie in a recording boundary blank.')
                 data['spike_times_'+kind].append(times)
                 res[kind+'_peaks'], res[kind+'_trace'] = peaks, traces[kind][:, cell]
                 mask = matrices[kind+'_exclusion_mask']
@@ -216,15 +250,24 @@ def load_saved_detection_folder(folder):
         source_folder = folder
     else:
         result_dir, source_folder = folder, folder
-    files = sorted(result_dir.glob('*_analyzed.npz'))
+    files = sorted([*result_dir.glob('*_analyzed.npz'), *result_dir.glob('*_labels.npz')])
+    # A manual revision replaces the automatic view for that recording, never doubles it.
+    latest = {}
+    for path in files:
+        stem = path.stem.removesuffix('_analyzed').removesuffix('_labels')
+        previous = latest.get(stem)
+        if previous is None or (path.stat().st_mtime_ns, path.name.endswith('_labels.npz')) > (previous.stat().st_mtime_ns, previous.name.endswith('_labels.npz')):
+            latest[stem] = path
+    files = sorted(latest.values())
     if not files:
-        raise ValueError('No saved *_analyzed.npz results found in this folder or its spike_detection subfolder.')
+        raise ValueError('No saved *_analyzed.npz or *_labels.npz results found in this folder or its spike_detection subfolder.')
     loaded, issues = {}, []
     for path in files:
         try:
             data = load_saved_detection(path)
-            stem = path.name.removesuffix('_analyzed.npz')
-            sources = [source_folder/(stem+ext) for ext in ('.csv', '.xlsx', '.npz')]
+            stem = path.stem.removesuffix('_analyzed').removesuffix('_labels')
+            sources = ([source_folder/stem] if Path(stem).suffix.lower() in ('.csv', '.xlsx', '.npz') else [])
+            sources += [source_folder/(stem+ext) for ext in ('.csv', '.xlsx', '.npz')]
             name = next((p.name for p in sources if p.is_file()), path.name)
             data.update(source_folder=str(source_folder), session_name=name,
                         session_path=str(next((p for p in sources if p.is_file()), path)))

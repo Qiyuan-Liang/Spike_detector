@@ -113,6 +113,7 @@ def effective_settings(params, baseline, frames, fs, n):
     pre, post = mask_windows(params)
     for key, val in [('SS pre-CS mask', pre), ('SS post-CS mask', post),
                      ('Initial blank', params.get('INITIAL_BLANK_MS', 0)),
+                     ('Final blank', params.get('FINAL_BLANK_MS', 50)),
                      ('CS min FWHM', params.get('CS_MIN_FWHM_MS', 4)),
                      ('SS max FWHM', params.get('SS_MAX_FWHM_MS', 4.5))]:
         if not np.isfinite(val) or val < 0:
@@ -131,6 +132,7 @@ def effective_settings(params, baseline, frames, fs, n):
                baseline_window_ms=size*1000/fs if method != 'Disable' else 0,
                frame_samples=int(frames), ss_mask_pre_ms=pre, ss_mask_post_ms=post,
                initial_blank_samples=int(np.ceil(float(params.get('INITIAL_BLANK_MS', 0))*fs/1000)),
+               final_blank_samples=int(np.ceil(float(params.get('FINAL_BLANK_MS', 50))*fs/1000)),
                ss_mask_pre_samples=int(np.ceil(pre*fs/1000)), ss_mask_post_samples=int(np.ceil(post*fs/1000)))
     if params.get('FRAME_PROCESSING_MODE', 'Rolling average') not in ('Rolling average', 'Downsampling frames'):
         raise ValueError('Unknown frame processing mode.')
