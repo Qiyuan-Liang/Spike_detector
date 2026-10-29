@@ -17,6 +17,7 @@ from PyQt6 import QtWidgets, QtCore
 from spike_detector.gui import (MainWindow, StatsViewerDialog, DetectionViewerDialog,
     BatchDetectionDialog, SettingsDialog, TemplateViewerDialog)
 from spike_detector.utils.batch import discover_batch_sessions, normalize_folder_paths
+from spike_detector.utils.validation import mask_windows
 
 
 class BatchDetectionTests(unittest.TestCase):
@@ -45,10 +46,21 @@ class BatchDetectionTests(unittest.TestCase):
 
     def test_ss_width_default_and_explicit_override(self):
         self.assertEqual(self.win.params['SS_MAX_FWHM_MS'], 4.5)
+        self.assertEqual(self.win.params['SS_MIN_DIST_MS'], 3.0)
+        self.assertEqual(mask_windows(self.win.params), (4.0, 6.0))
         dialog = SettingsDialog(self.win)
         self.assertFalse(hasattr(dialog, 'spin_ss_max_fwhm'))
         self.assertFalse(hasattr(dialog, 'spin_cs_min_fwhm'))
+        self.assertEqual(dialog.spin_ss_mind.value(), 3.0)
+        self.assertEqual(dialog.spin_ss_mask_pre.value(), 4.0)
+        self.assertEqual(dialog.spin_ss_mask_post.value(), 6.0)
         dialog.close()
+        # Explicit old values and the legacy symmetric mask survive loading.
+        self.win.load_all_settings(snapshot={'params': {'SS_MIN_DIST_MS': 7.0, 'SS_BLANK_MS': 18.0}}, quiet=True)
+        self.assertEqual(mask_windows(self.win.params), (9.0, 9.0))
+        self.assertEqual(self.win.params['SS_MIN_DIST_MS'], 7.0)
+        self.win.load_all_settings(snapshot={'params': {'SS_MASK_PRE_MS': 2.0, 'SS_MASK_POST_MS': 8.0}}, quiet=True)
+        self.assertEqual(mask_windows(self.win._current_settings_snapshot()['params']), (2.0, 8.0))
         self.assertEqual(self.win.qc_inputs['SS_MAX_FWHM_MS'].value(), 4.5)
         self.win.qc_inputs['SS_MAX_FWHM_MS'].setValue(3.0)
         self.assertEqual(self.win._current_settings_snapshot()['params']['SS_MAX_FWHM_MS'], 3.0)
@@ -56,6 +68,8 @@ class BatchDetectionTests(unittest.TestCase):
                    return_value=QtWidgets.QMessageBox.StandardButton.Yes):
             self.win.reset_app()
         self.assertEqual(self.win.params['SS_MAX_FWHM_MS'], 4.5)
+        self.assertEqual(self.win.params['SS_MIN_DIST_MS'], 3.0)
+        self.assertEqual(mask_windows(self.win.params), (4.0, 6.0))
 
     def test_shared_amplitude_qc_applies_to_batch_and_viewer(self):
         self.win.tabs_detection.setCurrentIndex(1)

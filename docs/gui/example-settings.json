@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "app_version": "3.6.50",
+  "app_version": "3.6.51",
   "params": {
     "NEGATIVE_GOING": true,
     "DETECTION_METHOD": "Template Matching",
@@ -18,8 +18,10 @@
     "SS_LOW_CUT_HZ": 0.0,
     "SS_HIGH_CUT_HZ": 0.0,
     "SS_THRESHOLD_SIGMA": 3.0,
-    "SS_MIN_DIST_MS": 4.0,
+    "SS_MIN_DIST_MS": 3.0,
     "SS_BLANK_MS": 18.0,
+    "SS_MASK_PRE_MS": 4.0,
+    "SS_MASK_POST_MS": 6.0,
     "SS_MAX_FWHM_MS": 4.5,
     "INITIAL_BLANK_MS": 150.0,
     "FINAL_BLANK_MS": 50.0,
@@ -71,7 +73,7 @@
     "STATS_PETH_BIN_MS": 1.0,
     "STATS_SS_TREND_S": 5.0,
     "STATS_CS_TREND_S": 5.0,
-    "DETECTION_VIEW_WINDOW_MS": 1000.0,
+    "DETECTION_VIEW_WINDOW_MS": 1000,
     "DETECTION_VIEW_Y_RANGE": 0.0,
     "DETECTION_VIEW_CENTER": 0,
     "DETECTION_VIEW_AUTO_START": true,
@@ -100,7 +102,7 @@
   "ui": {
     "center_slider": 0,
     "start_at_observation": true,
-    "window_ms": 1000.0,
+    "window_ms": 1000,
     "y_range": 0.0,
     "avg_frames": 3,
     "baseline_method": "Median",

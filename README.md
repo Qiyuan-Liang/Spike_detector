@@ -1,307 +1,109 @@
 # Spike Detector GUI
 
-Spike Detector is a PyQt application for detecting complex spikes (CS) and simple spikes (SS) from voltage-imaging recordings of mouse cerebellar Purkinje neurons, including AOD two-photon random-access imaging data.
+Detect complex spikes (CS) and simple spikes (SS) in voltage-imaging recordings of cerebellar Purkinje neurons. The desktop GUI supports threshold detection, template matching, cell-specific automatic templates, manual labels, batch processing and spike statistics.
 
-## Installation
+## Install And Run
 
-Requirements:
+Download the [latest release](https://github.com/Qiyuan-Liang/Spike_detector/releases/latest) for the packaged macOS ARM64 app or Windows build bundle. The Windows ZIP contains source and a one-click builder, rather than a prebuilt EXE. Locally built macOS apps are not Apple-notarized.
 
-- Python 3.10+
-- PyQt6
-- numpy, scipy, pandas, matplotlib
-- PyWavelets, scikit-learn
-- openpyxl
-- Jupyter/IPython packages for the analysis notebooks
-
-Recommended editable install:
+To run from source, use Python 3.10 or newer:
 
 ```bash
 conda create -n spike_detector python=3.11 -y
 conda activate spike_detector
 pip install -e .
-```
-
-You can also install into an existing Python environment:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-### UV Environment
-
-For a UV-managed environment on another machine:
-
-```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install -r requirements.txt
-```
-
-On Windows PowerShell:
-
-```powershell
-uv venv --python 3.11
-.venv\Scripts\Activate.ps1
-uv pip install -r requirements.txt
-```
-
-`requirements.txt` installs the project in editable mode with the full `all` extra, including GUI, notebook, and packaging dependencies. See `UV.md` for exact-environment replication from the ASAP7 conda environment and optional `uv.lock` creation.
-
-## Running The App
-
-From the repository root:
-
-```bash
 python -m spike_detector
 ```
 
-The package entry point is also available after installation:
+Alternatively, use `uv venv --python 3.11`, activate the environment, then `uv pip install -r requirements.txt`. See [UV.md](UV.md) for setup details. Launch with `python -m spike_detector` or `spike-detector`; direct execution of `gui.py` does not support package imports.
 
-```bash
-spike-detector
-```
+## Key Workflow
 
-With UV:
+1. **Select Folder** and choose a recording folder. Select a **Session** and **Cell**, then set **Positive-going** or **Negative-going** to match the indicator.
+2. Choose baseline correction and frame processing. **Rolling average** smooths adjacent frames; **Mean** averages non-overlapping frame groups and interpolates onto the original time grid. Optional **Denoise** has a separate settings dialog. Review the raw trace before detection.
+3. Select **Threshold**, **Template Matching**, or enable **Combo**. Set the shared **Spike QC** limits for CS and SS. Hover over any setting for its meaning; zero disables the indicated filter or QC limit.
+4. Click **Spike Detection**, then inspect **Detection Viewer** and **Spike Statistics**. **Batch detection** applies the same configuration to multiple selected folders.
+5. Leave **Save** unchecked for temporary viewing, or check it to retain results. **Save Settings** stores a reusable configuration; **Load Settings** restores it. **Load Session** opens previous results without running detection again.
 
-```bash
-uv run spike-detector
-```
+### Example: Five One-Minute Recordings
 
-Do not run `src/spike_detector/gui.py` directly by path; package-relative imports require module execution.
+The screenshots use `/Volumes/T7 Shield/data/20261029_B25/1min`: five 60-second recordings, each with one ROI at approximately 5.56 kHz. The source recordings are not included in the repository. The main and detection screenshots show the same clear CS/SS train in `1min_1.csv`, around 14.1 seconds (500-ms view).
 
-## Screenshot Walkthrough: Five One-Minute Recordings
+The [example settings](docs/gui/example-settings.json) use Negative-going polarity, Median baseline correction (30 ms), Rolling average (3 frames), and Combo. Seeds are CS 6.0 and SS 3.0; final amplitude-fit matching cutoffs are CS 30.0 and SS 5.0. SS matching low-pass is 700 Hz; Parallel and Whiten noise are off. QC uses CS minimum FWHM 4.0 ms and SS maximum FWHM 4.5 ms. This is an illustrative preset, not a validated accuracy benchmark.
 
-These screenshots use `/Volumes/T7 Shield/data/20261029_B25/1min` as the example input. The folder contains five 60-second CSV recordings, each with one `ROI1_UG` trace at approximately **5.56 kHz**. Coordinate tables are skipped automatically. The raw recordings are not distributed with the application.
+![Main window showing a clear CS/SS train](docs/gui/main-window.png)
 
-1. **Select Folder**, choose the example folder, and select Session/Cell. Set **Negative-going**, **Median** baseline correction with a **30.0-ms** window, and **Rolling average: 3** frames. The raw view begins after the 150-ms initial blank; the final 50 ms are excluded from analysis.
-2. For the illustrated run, enable **Combo**. In **Threshold**, use CS seed **6.0** and SS seed **3.0**. In **Template Matching**, use **Amplitude-fit LLR (Gaussian)**, CS response/noise MAD **30.0**, SS **5.0**, and SS matching low-pass **700 Hz**; Parallel and Whiten noise are off. Spike QC uses CS minimum FWHM **4.0 ms**, SS maximum FWHM **4.5 ms**, and other limits off. A reusable [example settings JSON](docs/gui/example-settings.json) accompanies the screenshots. Combo learns temporary templates per cell/recording, so the loaded bank counters may remain zero.
-3. Leave **Save** unchecked for temporary viewing results and click **Spike Detection**. Check Save to retain results in the data folder; existing results require overwrite confirmation. **Batch detection** applies the same settings across selected folders.
+In Detection Viewer, the tracks show raw/baseline, CS score, SS score, and raw with accepted event markers. SS ticks and green CS duration bars follow the indicator polarity: above positive-going traces and below negative-going traces. Rejection counts explain why an above-cutoff candidate may be absent from the accepted events. Recording exclusions are shaded. A short green dash marks a retained CS whose width could not be measured; it does not represent a measured FWHM.
 
-![Main GUI: preprocessing, Combo, template matching and shared Spike QC](docs/gui/main-window.png)
+![Detection results for the same CS/SS train](docs/gui/detection-viewer.png)
 
-The illustrated run found **278 CS and 5,338 SS events across five recording traces**. Both template classes were learned automatically in each recording. These counts describe this preset, not independently validated biological ground truth; shared ROI names do not prove that different recordings contain the same biological cell.
+Use **Run polarity-reversed control** to inspect matches in the opposite direction. The control is diagnostic, not a calibrated false-positive estimate; it may be unavailable for archived results lacking the required context. **Export as templates** saves detected waveforms, and **Save Figure** exports the current view.
 
-4. Inspect detected events in **Detection Viewer**. Its four tracks show raw/baseline, CS score, SS score and raw with event markers. The example has negative-going spikes, so markers are below the trace. Change the time window, run the polarity-reversed control for template matching, export detected templates, or save the current figure.
+## Detection And Defaults
 
-The screenshot reviews a saved result. Live-only controls such as polarity reversal can be disabled when the archived run lacks its frozen control context.
+**Threshold** detects peaks in the separately filtered CS and SS traces using a robust MAD-based noise estimate. CS events are detected and quality-checked first; accepted CS define the SS exclusion windows. SS detection then applies its own cutoff, spacing and shared QC. Set a type's threshold to zero to disable it; exports retain both types with empty arrays for the disabled one.
 
-![Detection Viewer for the first example recording](docs/gui/detection-viewer.png)
+**Template Matching** compares moving trace windows with loaded CS/SS template banks. **Amplitude-fit LLR (Gaussian)** fits template amplitude under a Gaussian noise model. Its GUI cutoff is matched response divided by the estimated noise scale, not a posterior spike probability or calibrated significance level. **Normalized Similarity** compares waveform shape. **Positive-core LLR (experimental)** changes SS matching to positive weights in a central 3-ms template core; it discards negative template lobes and therefore some waveform information. Check this experimental option against independent labels.
 
-5. Open **Spike Statistics** and use **Path → Session → Cell** to choose the records to pool. Page 1 shows waveforms, exposure-corrected ACGs, FWHM, amplitude SNR, instantaneous rate and summaries. ACG settings are specific to this page; **Distribution bins** controls histograms.
+**Combo** runs threshold seeds → temporary templates → template matching. It learns aligned, normalized templates separately for each cell/session, requiring at least three clean seeds per type. The Threshold tab controls seed selection; Template Matching controls the final pass, which can recover events below the seed cutoff. If seeds are insufficient, a loaded bank supplies the fallback; otherwise that type has no available template. Zero seed threshold disables seed collection for that type, but an available loaded bank can still detect it.
 
-![Statistics overview for all five example recordings](docs/gui/statistics-overview.png)
+**Parallel** groups template shapes and scores the enabled groups; **View** shows their membership and selection. Advanced Settings controls PCA components. More groups can recover varied shapes but also offer more opportunities for false matches. **Whiten noise** estimates background temporal correlations and applies the same noise transformation to data and templates. It is available for template matching, Combo and batch detection. Compare results with and without it using held-out labels.
 
-6. Click **Next Page** for the SS/CS diagnostics below. Change SS PETH range/bin width and the separate SS/CS rate windows in the upper settings row. **Previous Page** returns to the overview; **Save Figure** exports whichever page is visible.
+Fresh/reset defaults include:
 
-![Statistics details: SS above CS, dF/F and time courses, CS-triggered SS rate at right](docs/gui/statistics-details.png)
+| Setting | Default |
+| --- | --- |
+| Baseline correction | Median, 30 ms |
+| Polarity | Negative-going |
+| CS filter | Low-pass 150 Hz; high-pass off |
+| SS filter | Off |
+| Threshold / Combo seeds | CS 6.0, SS 3.0 |
+| Template response/noise cutoff | CS 30.0, SS 5.0 |
+| SS minimum spacing | 3 ms |
+| SS exclusion around CS | 4 ms before, 6 ms after |
+| Shared width QC | CS minimum 4.0 ms; SS maximum 4.5 ms |
+| Recording blanks | Initial 150 ms; final 50 ms |
+| Viewer window | 1000 ms |
 
-The [editable page-2 SVG](docs/gui/statistics-details.svg) retains **Arial text as text**, rather than outlined glyphs. GUI screenshots are raster PNGs; use SVG or PDF for editing exported plot text.
+Change spacing and CS-related SS exclusions in **Advanced Settings**. Template windows touching excluded samples are also rejected, so their effective excluded region can extend beyond the requested interval. Existing saved settings remain authoritative until changed or reset.
 
-## Data Inputs
+**Spike QC** applies amplitude SNR and minimum/maximum FWHM limits in all detection modes. Unmeasurable widths remain marked uncertain and are retained; finite widths outside enabled limits are rejected. FWHM summaries omit uncertain widths. Detection cutoffs, amplitude SNR, and waveform width are different measurements: tune them separately. Validate sensitivity and false positives with independent manual labels across quiet periods, bursts and cells; attractive waveforms or larger event counts alone do not establish accuracy.
 
-Click **Select Folder** and choose the master directory containing recordings. Supported inputs include:
+## Statistics
 
-- Raw `.xlsx` or `.csv` trace files, with time in the first column and cells/ROIs in the remaining columns.
-- Folders containing `.xlsx` files.
-- Existing Spike Detector `*_analyzed.npz` result files.
+Choose **Path → Session → Cell** to pool the desired records. Pooling never forms spike pairs across different cells or sessions. **Distribution bins** controls histogram resolution; all statistics controls are saved with the configuration.
 
-The loader skips auxiliary `*_time_offsets.csv`/`.xlsx` and `*_coordinates.csv`/`.xlsx` files, plus recordings with fewer than 128 time samples. It reports skipped inputs in the GUI; an otherwise valid trace with no detected spikes can still be processed.
+Page 1 shows CS and SS waveforms, ACG, FWHM, amplitude SNR, instantaneous rate and summaries. ACGs show conditional spike rate in Hz, with recording-edge and observation-mask exposure correction and self-pairs excluded. Their half-window/bin defaults are CS 1000/10 ms and SS 100/1 ms.
 
-With **Save** checked, outputs are written to each input folder’s `spike_detection/` directory. Otherwise viewing results are temporary and cleaned automatically.
+![Statistics overview](docs/gui/statistics-overview.png)
 
-## Default Detection Algorithm
+Click **Next Page** for SS above CS, each with local CV2, spike dF/F and paired amplitude/rate time courses. The CS-triggered SS-rate plot sits at right. Page-specific controls replace ACG settings with PETH range/bin size and separate SS/CS time-course windows.
 
-The default spike detection method is **Threshold** detection. This is the recommended starting point for AOD/ASAP Purkinje-cell recordings.
+![Statistics details](docs/gui/statistics-details.png)
 
-The default workflow is:
+- **CV2:** `2 × |ISI₂ − ISI₁| / (ISI₂ + ISI₁)`, computed from consecutive intervals within uninterrupted observed segments. It never bridges masks or recordings.
+- **dF/F:** saved per-event amplitudes take precedence, including unavailable values. Missing measurements use the `Analysis/compare.ipynb` fallback: a 30-ms event window and central approximately ±5-ms extremum search. Values are polarity-aligned percentages: `s × 100 × (Fpeak − F0) / |F0|`, where `s` is −1 for negative-going and +1 for positive-going. Invalid baseline or unavailable amplitude remains missing, rather than zero.
+- **Time courses:** sessions concatenate in numerical filename order within one Path, retaining full acquisition durations and marking joins. Unknown between-session gaps are not invented. Five-second non-overlapping bins show mean finite dF/F and event count divided by observed cell-time, with separate SS/CS window settings. Missing cells preserve empty time slots; lines never bridge sessions. Multiple batch Paths leave time courses blank until one Path is selected. These are descriptive amplitude/rate trends, not a fitted bleaching model.
+- **CS-triggered SS rate:** defaults to −20 through +60 ms with 1-ms bins. Counts are divided by observable SS exposure within each cell/session before pooling. Grey bins have no exposure; they do not demonstrate a biological pause.
 
-1. Apply the selected frame processing and baseline correction to each trace.
-2. Build CS and SS detection traces using the configured filter bands. A cutoff value of `0` disables that side of the filter.
-3. Estimate noise using a robust MAD-based sigma.
-4. Detect CS local maxima above the CS threshold, apply minimum spacing, then the shared amplitude-SNR and width QC limits.
-5. Exclude SS around accepted CS using the separate before/after windows in **Advanced Settings** (default 9 ms per side).
-6. Detect SS local maxima above the SS threshold, using SS minimum spacing. CS QC rejections rebuild SS exclusions before this final SS pass.
-7. Apply the same **Spike QC** amplitude-SNR and minimum/maximum FWHM limits to SS.
-8. Save event times, processed traces, per-event SNR, FWHM, `-dF/F (%)`, waveform snippets, and the exact settings snapshot used for that run.
+**Save Figure** exports the visible page. SVG and PDF preserve editable Arial text; PNG screenshots are raster images. An [editable example SVG](docs/gui/statistics-details.svg) is included.
 
-Current default values include:
+## Files, Settings And Manual Labels
 
-- Detection method: `Threshold`
-- Baseline correction: `Median`, `30 ms`
-- CS filter: low cut `0 Hz`, high cut `150 Hz`
-- SS filter: low cut `0 Hz`, high cut `0 Hz` (unfiltered)
-- CS threshold: `6.0 x MAD`
-- SS threshold: `2.5 x MAD`
-- CS minimum FWHM: `4 ms`
-- SS minimum distance: `4 ms`
-- SS exclusion around CS: `9 ms` before and `9 ms` after (`18 ms` total)
-- SS max FWHM filter: enabled, discard finite SS FWHM values `> 4.5 ms`
-- Negative-going detection: enabled
+Inputs are CSV/XLSX tables with time in the first column and cells in subsequent columns, or supported saved NPZ recordings. Time units are inferred and reported. Auxiliary coordinate/time-offset tables, Excel lock files and malformed recordings are skipped. Invalid timestamps, nonfinite traces or filter bands above Nyquist require correction before detection.
 
-Template matching is available as an alternative to threshold detection.
+Initial/final blanks are excluded before preprocessing, noise estimation, detection and statistics. Rolling averages smooth blanked segments separately for display, without letting their artifacts enter the observed trace. New views start after the initial blank. Raw acquisition samples remain archived, so downstream analysis must respect `analysis_valid_mask`.
 
-## Basic Workflow
+With **Save** enabled, each recording's `spike_detection/` folder receives `SESSION_analyzed.npz` and a matching settings JSON. Existing results require confirmation before replacement; source recordings are preserved. Exports contain traces, events, masks, per-event measurements and run settings. Without Save, temporary results remain viewable until closing and abandoned temporary files are cleaned on relaunch.
 
-1. Click **Select Folder**.
-2. Select a session and cell for preview.
-3. Adjust preprocessing settings if needed:
-   - Baseline correction method, window, and percentile.
-   - Frame processing mode (**Rolling average** or **Mean**) and frame count.
-   - Optional wavelet denoising.
-4. Use the **Threshold** tab to adjust CS/SS filter bands and sigma thresholds.
-5. Set **Spike polarity** below Cell, and **Spike QC** beneath the detection tabs. Use **Advanced Settings** for event spacing, exclusion/template windows, denoised CS detection, colors and scale-bar units.
-6. Click **Spike Detection** to process all loaded sessions/cells.
-7. Inspect results with **Detection Viewer** and **Spike Statistics**.
+**Load Session** restores archived traces, events and run settings; switching sessions follows their saved configuration. Changing controls prepares a new run and does not alter archived detections. **Load Settings** changes configuration without loading events. Saved template paths must remain accessible when moving configurations between computers. Reset is inside Advanced Settings.
 
-## Saved Outputs
+For manual work, click **Select As** and choose **CS template**, **SS template** or **Spike label**. Template selection collects waveform examples. Spike label mode starts empty or reopens existing manual labels: left-click adds SS, Control+left-click adds CS, and right-click removes the nearest selection. Selections remain associated with their original cell/session as you navigate. **Save Labels** writes `SESSION_labels.npz` in the detection-result format and makes the labels available to Statistics. Labels are marked partial; an unlabelled time is not automatically a confirmed negative.
 
-The **Save** checkbox controls both ordinary and batch detection; it is off by default.
+## Build And Help
 
-- **Save off:** every run creates temporary NPZ results and matching settings sidecars for viewing, outside the recording folders. Existing saved results are preserved. Temporary viewing exports are deleted when the main GUI closes; abandoned exports are cleaned on the next launch. Another running GUI's exports are protected by an ownership lock.
-- **Save on:** results are saved in each input folder's `spike_detection/` directory as `SESSION_analyzed.npz` and `SESSION_analyzed_settings.json`. If those outputs or the legacy `SESSION_analyzed.npy` exist, a warning lists the affected files before detection. Cancel preserves them; proceed replaces the result pair and removes the superseded legacy NPY. Replacement uses staging and rollback on write failure. Input recordings are never overwritten.
+Build the Windows source bundle with `python scripts/create_windows_bundle.py`; extract it on Windows and run `build_windows_uv.bat`. Keep the complete output application folder. See [WINDOWS_BUILD.md](WINDOWS_BUILD.md).
 
-Recognized older viewing exports in `spike_detection/_temporary_detection/` are cleaned when a data folder is loaded. Unrecognized files and symbolic links are preserved. Settings files from earlier versions translate **override** to **Save**; review this checkbox after loading an old configuration.
+For macOS, install packaging dependencies with `uv sync --python 3.11 --extra packaging`, then run `.venv/bin/python -m PyInstaller --noconfirm --clean packaging/pyinstaller/spike_detector.spec`. The app appears in `dist/Spike Detector.app`. Build on the target platform.
 
-Each settings sidecar has the same structure as **Save Settings**, so it can reload the run's GUI configuration. Temporary files are intended for inspection during the current GUI session; enable **Save** for results needed after closing the app.
-
-In **Threshold** mode, set **CS threshold** or **SS threshold** to **0** to disable that spike type. The export retains both CS and SS fields, with empty event arrays for the disabled type. Both traces remain available for inspection. In **Combo**, zero disables seed collection for that type; a loaded template bank can still supply the final matching pass.
-
-In Detection Viewer, SS ticks and CS duration bars sit above the raw trace for positive-going indicators and below for negative-going indicators. A retained CS with uncertain FWHM still has a short green dash. The main raw-trace preview has no title; its legend remains above the plotting area.
-
-## Manual Settings
-
-- **Save Settings** writes the current GUI configuration to a JSON file.
-- **Load Settings** restores parameters from a saved JSON file.
-- Detection result sidecars can also be loaded through **Load Settings** to configure a new run; this does not load events.
-- **Load Session** opens a recording folder or its `spike_detection` subfolder and restores existing saved detections without rerunning detection. The Detection Viewer opens automatically and Spike Statistics works on those archived results. Both `_analyzed.npz` and `_labels.npz` are supported; when both exist for one recording, the most recently saved result is loaded once.
-- **Reset App** is inside **Advanced Settings**, with confirmation.
-
-## Inspection And Export
-
-The main window has native segmented **Positive-going** / **Negative-going** tabs spanning the full row below Cell. Session and Cell each have their own row. The tabs set the existing polarity parameter used by settings files, ordinary detection, Combo, and batch detection. The selector has no empty background panel. The duplicate Advanced Settings switch has been removed. Raw plots retain the recorded direction; the choice controls the sign used for detecting events.
-
-The Threshold tab groups **CS** and **SS** controls into two rows each: high-pass/low-pass cutoffs, then filter order/threshold. Filter cutoff `0` disables that cutoff (explained in hover help); threshold `0` still disables the corresponding spike type (or its Combo seeds). The controls keep the same saved parameter names and detection calculations. The upper panel follows the active tab’s height, with consistent spacing between rows and groups. **Parallel** and **Save**, like other GUI controls, start with capital letters.
-
-The narrower left panel keeps its natural width, aligns at the top, and uses shared input columns for Session, Cell, baseline correction, baseline window and percentile controls. Frame processing and its frame count share one row. Spike QC uses compact **Min SNR**, **Min FWHM** and **Max FWHM** inputs. Threshold/amplitude-SNR and millisecond settings display one decimal; frequencies display integer Hz. Correlation and opacity controls keep their finer precision. The Denoise checkbox indicates whether denoising is enabled. **Mean** is the former Downsampling frames option: it averages non-overlapping frame groups and interpolates their means onto the original time grid. Its calculation is unchanged; older settings and archived runs retain the historical stored value and display **Mean**.
-
-**Load Session** uses the raw, frame-processed, baseline and filtered traces saved in each analyzed NPZ, together with accepted events, observation masks, event SNR and width reports. Changing Session in the main window or Detection Viewer restores that recording’s preprocessing/detection settings and data path. Statistics pool archived measurements and never form cross-recording ACG pairs. Edits prepare a new detection; they do not alter the displayed archived results. Explicitly running detection uses the edited controls and the normal Save/overwrite policy. Embedded run settings take precedence over a conflicting settings sidecar; old sub-decimal parameters are retained in metadata even when controls display rounded values. Missing external template files are reported, but stored event results remain viewable.
-
-New exports also preserve matching scores, local threshold vectors, candidate diagnostics and the GUI configuration. For older files lacking these vectors, the viewer explicitly labels the missing information and omits the corresponding cutoff lines rather than reconstructing scores or rerunning detection. Files missing the traces, masks or run settings required for reliable restoration are skipped with an explanation. The loader accepts permanent `*_analyzed.npz` results at the selected folder’s top level or in its `spike_detection` subfolder; it does not scan nested experiment folders or temporary viewing exports.
-
-Useful viewer tools:
-
-- Hover over a setting input to see a short description of what it controls.
-- **Save Settings** stores detection, all six shared QC limits, baseline, advanced, denoising (including preview size and advanced-panel visibility), statistics, colors, main-view controls, Detection Viewer window/Y-range/time position, and Slider Viewer Y-range/time position, plus paths to the currently loaded CS/SS template NPZ files. **Load Settings** restores those template banks when the files are available and reports missing sources. The JSON references the NPZ files; keep them accessible when moving settings between computers. Data folders and Path/Session/Cell navigation choices remain specific to the loaded recordings. Confirm dialog edits with **OK** before saving the main configuration.
-- **Spike Statistics**: SS/CS waveform, autocorrelogram (ACG), FWHM, SNR, and instantaneous-rate summaries. The upper controls set and remember separate ACG half-windows and bin widths (CS ±1000 ms in 10 ms bins; SS ±100 ms in 1 ms bins by default). ACGs show conditional spike rate in Hz: each bin’s within-cell/session pair count is divided by the total observed target time contributed by its reference spikes. This uses the actual bin width, corrects recording boundaries, excludes masked observation gaps, and excludes self/zero-lag pairs. Selecting **All** pools counts and exposure separately, without pairing events across cells or recordings.
-- **Detection Viewer**: raw traces, detection traces, thresholds, and detected events.
-- The Detection Viewer raw-trace scale bar uses $\sigma_{\mathrm{MAD}}=1.4826\,\mathrm{median}(|x-\mathrm{median}(x)|)$ of the baseline-corrected trace. This is an SD-equivalent noise estimate for Gaussian noise, not the unscaled MAD or the sample SD; a zero-MAD trace falls back to its SD.
-- **Export as templates**: save detected waveforms for template matching.
-- **Save Figure**: export publication figures. SVG exports preserve text as editable text when opened in tools such as Adobe Illustrator.
-
-## Spike Statistics Pages
-
-The Statistics window fits the screen on opening, preserves square distribution panels, and wraps summaries. **Distribution bins** (default 20, range 1–200) controls FWHM, SNR, instantaneous-rate, local CV2 and dF/F histograms. Settings are saved/loaded/reset with the GUI.
-
-Page 1 keeps the waveform/ACG/FWHM/SNR/rate overview. Page 2 puts **SS** in the upper row and **CS** below, each with **local CV2 → spike dF/F → dF/F and rate over time**. The **CS-triggered SS-rate** plot sits at the right, centred between the rows. The upper row of settings switches from ACG controls to page-2 PETH and time-course settings.
-
-- **CS-triggered SS rate:** default −20 to +60 ms relative to CS, with 1-ms bins. Before/after range and bin width are editable. Counts are divided by observable SS time summed over valid CS triggers, giving Hz. Counts and exposure are calculated within each cell/session before pooling. Masked time and recording edges reduce exposure; zero-exposure bins are grey and undefined, not a zero-rate biological pause. CS references remain valid even if SS is deliberately blanked around them.
-- **Local CV2:** `2 × |ISI[i+1] − ISI[i]| / (ISI[i+1] + ISI[i])`, from three consecutive spikes in one uninterrupted observed segment. Histograms pool local values, not squared CV or per-cell mean CV2. They never bridge masks, sessions or different cells. See [Holt et al. (1996)](https://pubmed.ncbi.nlm.nih.gov/8734581/).
-- **Spike dF/F:** follows `Analysis/compare.ipynb`: exported `event_minus_dff_percent_cs/ss` values take precedence, including explicit NaNs. Missing fields/absent slots are recomputed from the frame-processed fluorescence and baseline, using the comparison fallback's 30-ms event window and central approximately ±5-ms extremum search. Amplitude is `s × 100 × (F_peak − F0) / |F0|`, with `s = −1` for negative-going and `+1` for positive-going indicators. Zero/nonfinite F0 and unavailable measurements stay NaN; no missing amplitude is replaced by zero or redetected. Histograms retain finite event values on this polarity-aligned percentage scale. The original saved amplitude convention remains authoritative in older files.
-- **Time courses / bleaching overview:** the selected source folder's sessions are concatenated in natural numerical filename order (e.g. trial2 before trial10), retaining each full acquisition duration. Unknown inter-session gaps are not invented. A missing selected cell leaves a blank time slot. Lines stop at session joins, marked by vertical dotted lines. Orange/green shows mean finite SS/CS spike dF/F on the left axis; blue shows event rate on the right. Separate SS and CS windows default to **5 seconds** and define non-overlapping bins for both curves; bins never cross sessions. Rate is total event count divided by observed cell-time, including proper partial-bin and detector-mask correction. Multiple selected cells contribute events and observed cell-time; their rates are not summed. Empty observed bins have zero rate and missing dF/F; bins without exposure are unavailable.
-
-For **batch detection**, Path = All may pool independent-record distributions and PETH components, but time courses are **left blank when multiple source folders are selected**. Select one Path to view that experiment's concatenated recordings. Cells are never aligned or joined across different experiment folders.
-
-These plots describe detected events. A dF/F/rate trend alone does not establish photobleaching: changing activity, detection sensitivity, baseline and event selection can contribute. Partial manual labels remain marked partial/unverified. All plot text uses Arial; SVG retains text elements and PDF uses TrueType text, while traces and histogram bars remain vector graphics.
-
-## Recording Boundary Blanks And Manual Labels
-
-New raw/detection views use a **1000.0 ms** window and begin at the first sample after the initial blank (**150.0 ms** by default, relative to recording start). Explicit slider navigation can still display the full recording. When a window contains observed samples, excluded boundary artifacts do not determine its automatic vertical scale. Saved custom windows/positions are restored through settings; these defaults do not overwrite them.
-
-**Advanced Settings → Initial blank** defaults to **150.0 ms**, and **Final blank** defaults to **50.0 ms**. Zero disables either side. They define the observed recording interval before frame averaging, baseline estimation, denoising, filtering, template learning/matching, noise estimation and waveform statistics. Rolling averaging uses reflected padding within that interval, so it neither includes excluded artifacts nor introduces a zero-padding edge dip. Input timestamps and original raw samples remain in result files. Excluded regions are shaded in viewers; rolling averaging smooths each blanked segment separately for display without mixing it into observed samples or baseline/noise estimates. Durations round upward to native samples; recordings without enough observed samples for their filters are skipped with an explicit error.
-
-Exports include a common Boolean `analysis_valid_mask` and `analysis_duration_s`, alongside the per-type detection masks and full `recording_duration_s`. Analysis code must apply `analysis_valid_mask` before reducing the archived raw arrays; `raw_data` deliberately preserves acquisition values for review. Older saved detections keep their recorded exclusions; rerun detection or save new manual labels to apply the new final blank. This revision does not silently change events or invent a final blank in older result files.
-
-Click **Select As** in the main raw-trace viewer. Its first row, **Type**, offers **CS template**, **SS template**, and **Spike label**.
-
-- Template types retain the existing extraction windows and template-bank export. Left click selects a complete window; right click inside a selected window removes it. Selections are stored by their original recording and cell, so navigating does not project them onto other trials. Saving pools the selected windows for the active type across recordings/cells and resamples each using its own sampling rate. Source recording, cell, time, sampling rate and preprocessing metadata accompany the template file.
-- **Spike label** starts empty, or reopens that recording’s previous manual labels. Automatic detections are never imported as human labels. Left click adds SS; **Control + left click** adds CS. Click times snap to the nearest native sample. Choosing the other type at the same sample changes its class. Right click removes the nearest label within 10 screen pixels in time. Boundary blanks cannot be labelled.
-- Navigate Session/Cell normally to label many trials in one editing session. **Save Labels** writes a separate `spike_detection/RECORDING_labels.npz` and matching settings sidecar for every recording with annotations, plus the explicitly saved current cell (which may have an empty label set). It explicitly saves permanent labels, independently of the detector’s Save checkbox, asks before replacing previous label files, and preserves the automatic `_analyzed.npz` files. Saving runs in a worker; a failed save preserves drafts and prior files for retry. **Abort** discards drafts. Opening a different folder or closing with unsaved annotations asks before discarding them.
-- Label files use the same raw/time/cell/spike-time/trace/mask/SNR/FWHM schema as normal results, plus `label_metadata_json`. Manual labels are retained regardless of automatic thresholds or Spike QC; SNR and FWHM are measured and unavailable values remain flagged. Spike Statistics and Detection Viewer use the saved manual results immediately, and Load Session can reopen them. Cells never annotated or explicitly saved as an empty label set are omitted from manual statistics; mere navigation does not mark them as reviewed. Measurements use the preprocessing snapshot captured for that recording when label mode is entered. The summary marks manual results as partial/unverified; label counts per observed time are not evidence that every spike was annotated.
-
-For benchmarking/training, use the explicit cell provenance and label metadata. A label set is marked **partial**, and an absent label or an untouched cell is not automatically a confirmed negative. `viewed_intervals_ms` records displayed windows where annotations were added, not independently verified complete-review intervals. Review completeness separately before treating manual labels as exhaustive ground truth. Template windows and annotation drafts remain tied to their original cells/sessions even when their sampling rates differ.
-
-## Troubleshooting
-
-- If the GUI does not start, confirm `PyQt6` is installed in the active environment.
-- If imports fail, run from the repository root with `python -m spike_detector`.
-- If Excel loading fails, check that the first column is time and remaining columns are cell traces.
-- If old parameters reappear, check whether an older settings JSON was loaded; saved settings override current defaults.
-
-
-### Batch detection
-
-Set the detection method and all processing controls in the main GUI, then click **Batch detection**. Paste one folder path per line, use **Add folder…**, or **Load path list…** to import a UTF-8 text file. Relative paths in imported lists are resolved from the list file’s directory. Click **Run batch detection** to process all top-level CSV, XLSX and NPZ sessions with the same settings and templates.
-
-On macOS, pasted backslash-separated paths such as `Volumes\T7 Shield\Organized\...` are resolved as `/Volumes/T7 Shield/Organized/...`. The batch dialog shows skipped or unavailable paths in a scrollable details box. **Close** dismisses the dialog even while detection continues in the main window.
-
-The **Save** checkbox applies to every batch folder: unchecked runs use temporary viewing exports; checked runs save into each input folder’s `spike_detection/` directory and ask before replacing existing outputs. Duplicate paths are collapsed and sessions with identical names in different folders remain separate. If different input extensions share a filename stem in a batch folder, output names retain the input extension to avoid collisions.
-
-The Info panel reports every path, completed sessions/cells, pooled statistics and input/detection/save errors. Close the batch dialog and open **Spike Statistics** to filter by **Path → Session → Cell**, including **All**. Selecting a new master folder returns to ordinary single-folder mode. Batch processing loads all sessions into memory, then detects each cell and compresses the result file on worker threads. The bottom status bar shows completed cells and the saving stage; settings are locked during detection. The same template method, bank, thresholds and masks apply to each batch session.
-
-See [the workflow review and improvement priorities](docs/SPIKE_DETECTION_REVIEW.md) for the detection-method assessment and comparison with voltage-imaging and electrophysiology approaches.
-
-Excel's temporary owner/lock files (`~$*.xlsx`) are ignored during ordinary and batch folder discovery. They are not recording workbooks and are left on disk for Excel to manage. Selecting one directly produces an explanatory message; format errors in genuine workbook files are still reported.
-
-
-### Spike QC and template matching (3.6.42)
-
-**Local noise** in the Threshold tab (previously mislabeled Local baseline) selects a centered rolling, Gaussian-scaled MAD estimate for threshold cutoffs and Combo seeds. It does not subtract a second baseline or change template scores, amplitude-SNR windows or the whitening spectrum. In Denoising Settings, **Envelope threshold (SD)** instead uses the local cluster-envelope mean plus the selected multiplier times local SD; increasing it attenuates more frames. Hover descriptions and **Tips** distinguish these quantities.
-
-Event amplitude SNR uses the same intervals for CS and SS: amplitude baseline −25 to −5 ms, local noise −150 to −5 ms, detected-SS exclusion −2 to +4 ms and detected-CS exclusion −9 to +18 ms. Both amplitude-baseline and noise estimates exclude these detected-event intervals and respect existing detector masks (which can exclude additional samples). The baseline is the median of remaining samples, requiring at least three finite samples; its absence produces NaN SNR rather than a contaminated or invented baseline. Noise remains Gaussian-scaled MAD, with at least 20 samples and approximately 5 ms of retained samples for a local estimate, then the existing recording-wide fallback. NaNs preserve event order in exported SNR arrays and are excluded from histogram/summary counts. Broad CS tails and undetected burst spikes can still contaminate these fixed windows. These intervals describe event SNR, not the recording-wide whitening spectrum or the GUI baseline correction. Exported analysis settings include `event_snr_policy`; rerun detection to regenerate exported metrics with this policy.
-
-**Spike QC** is fixed beneath both detection tabs. Each CS/SS row has a minimum amplitude SNR, minimum FWHM and maximum FWHM. Zero disables that individual limit; hover over inputs for definitions. New amplitude SNR limits and the new CS maximum/SS minimum widths start at zero; the existing CS minimum of 4 ms and SS maximum of 4.5 ms are preserved. Minimum and maximum widths are inclusive and contradictory enabled limits are rejected before detection. All six values are saved, loaded, reset and applied in ordinary, batch and Combo detection, including threshold seeds used to learn temporary templates.
-
-Amplitude QC uses the same event metric as Spike Statistics and exported event SNR: the polarity-oriented, frame-processed, baseline-corrected signal at the candidate, minus its local amplitude baseline, divided by Gaussian-scaled noise MAD. It uses the original signal before denoising, detection filtering or whitening. Candidate-event noise exclusions are frozen for each QC stage, and accepted events retain those SNR values for statistics/export. Unavailable SNR is reported separately and rejected when its minimum is enabled. FWHM uses each type's filtered detection waveform before whitening; this also makes threshold SS widths reflect the selected SS filter. Unmeasurable widths are retained and explicitly flagged as uncertain. If CS QC rejects proposals, SS is rescored with exclusions rebuilt from accepted CS; this can require one extra pass. Combo freezes its learned bank before final matching and uses the same QC for seeds and final events. No final events are fed back into template learning.
-
-The duplicate template response/filtered-height floors and Advanced Settings width controls have been removed from the GUI. Legacy projection cutoffs are not converted numerically into amplitude SNR: old settings files load with new amplitude gates disabled and a review notice, while preserving width limits and translating a disabled legacy SS maximum to zero. Existing detection results are not rewritten. `spike_qc_json` and `width_quality_json` record limits, measurement policy, rejected/unavailable counts and candidate metrics. Detection Viewer shows separate amplitude-SNR and width losses.
-
-**Whiten noise** (beside Shape groups) optionally accounts for temporal noise correlations in every template method, including Combo's final pass and batch detection. It is off by default and saved/loaded/reset with the other settings. Each cell/type estimates its own background spectrum using overlapping Hann windows confined to contiguous, unmasked stretches. Positive excursions above an independent 3-MAD cutoff are excluded from this noise fit (CS −20/+80 ms; SS −2/+4 ms); these noise-fit exclusions do not reject final candidates. Median periodograms are smoothed in log power, floored at 1% of the maximum PSD, and converted to an inverse-square-root spectral gain capped at 10. A symmetric FIR approximates this gain with up to 5 ms support on each side. The same FIR transforms the recording and matching kernels: full CS waveform or the existing nominal 3 ms SS core. Positive-core clipping occurs before whitening; whitening may introduce signed kernel coefficients. Score noise MAD is measured on the whitened background with FIR-contaminated samples excluded. Score masks cover the support of both the trace FIR and transformed kernel, so extra neighboring samples are excluded near recording boundaries and CS masks.
-
-Whitening is approximate and regularized, not a conversion of cutoffs into calibrated significance levels. Reassess response and correlation cutoffs when enabling it; they refer to transformed signals and are not interchangeable with unwhitened values. Four clean spectral windows of at least 32 samples and enough background after FIR padding are required; otherwise the track explicitly falls back to ordinary matching. Info and Detection Viewer show applied/skipped status, and exported analysis settings record the fit parameters and FIR coefficients per cell/type. Polarity-reversed controls freeze the original whitening filters and noise-fit masks as well as the templates and detection masks. Spike QC, original waveform plots, SNR and FWHM measurements are not whitened. Validate accuracy on independent annotations or electrophysiology; reduced noise correlation alone does not establish improved detection.
-
-New/reset detection defaults are **CS template match response/noise MAD = 30.0**, **SS = 5.0**, and **SS threshold = 3.0 σ**. The last value is labelled **Seed (σ)** only while Combo is enabled: it selects first-pass events used to learn temporary templates. With Combo off it is the ordinary SS detection threshold. The template cutoffs control Combo's second pass; seed events are not automatically final detections. Explicit values in saved settings still take precedence over these defaults.
-
-**Combo** (checkbox beside the detection tabs) runs **Threshold seeds → temporary templates → template matching** for both ordinary and batch detection, regardless of the selected tab. The Threshold tab's CS/SS cutoffs select seed events; choose conservative values. The Template Matching tab selects the final scoring method and cutoffs. Advanced Settings controls extraction windows, event spacing and exclusions; Spike QC controls amplitude SNR and width limits. Combo aligns and amplitude-normalizes complete, isolated seed windows and forms robust median templates per cell/session. It requires at least three clean seeds for an automatic kernel; parallel matching uses only shape groups with enough seeds. Seed-quality exclusions affect learning, not a new final-event shape gate. When a type lacks sufficient seeds, its loaded template bank is used if available; otherwise that track reports no available templates and has no detected events. Confident CS seeds still exclude SS contamination if no CS bank is available. Final template detections can occur below the initial seed threshold.
-
-Combo does not replace the user-loaded banks or iteratively retrain on its final events. Manual enabled-group choices apply to loaded fallback banks; all supported automatic groups are scored. The Detection Viewer and Info report seed/clean/kernel counts and automatic/fallback/unavailable sources. Per-cell learning diagnostics and kernels are included in exported analysis settings, and polarity-reversed controls reuse the original frozen templates. Assess sensitivity and false detections using held-out annotations; additional event counts alone do not establish accuracy. Combo is disabled by default and its checkbox is included in Save/Load Settings.
-
-Load threshold-derived SS/CS templates, then choose **Amplitude-fit LLR (Gaussian)**, **Positive-core LLR (experimental)**, or **Normalized Similarity** under **Matching score** in the Template Matching tab. **Clear** empties both banks. The stored `LLR Probability Vector` name remains for compatibility; its score is a positive-amplitude-fitted Gaussian likelihood gain, not a probability. **CS/SS match response / noise MAD** controls the positive template response divided by global per-sample noise MAD, with a plotted gain cutoff of `cutoff² / 2`. It is distinct from Spike QC's local amplitude SNR and is not a calibrated false-positive z-score. These score cutoff boxes allow values through 100. SS matches use a short nominal 3 ms core to tolerate overlapping or truncated tails. **Normalized Similarity** uses Pearson correlation with defaults CS `r ≥ 0.90`, SS `r ≥ 0.80`. All methods then use the shared Spike QC limits; there are no additional hidden 3-MAD CS or minimum-SS-response gates in the GUI pipeline. Review old detection settings before reuse.
-
-**Positive-core LLR (experimental)** keeps the existing CS detector and changes only SS scoring. It fits a positive-only 3 ms core of the pooled SS template to the baseline-corrected, optionally low-pass-filtered trace. This avoids a neighboring negative trough adding evidence for a positive SS through the negative weights of a mean-centered template. The SS matched-response cutoff, shared Spike QC, Advanced Settings SS spacing, CS masks, parallel groups and batch detection apply. There is no full-waveform correlation, strong-anchor, or 25 ms neighborhood gate. The former **Burst-aware LLR** settings key is retained so saved settings select this method, but the behavior changed in version 3.6.25; rerun detection to compare results. The cutoff is not a calibrated false-positive probability. Assess additions with held-out manual annotations across cells, bursts and quiet periods, and run the polarity-reversed control. That control is diagnostic rather than a calibrated specificity estimate.
-
-The Detection Viewer shades excluded score regions and lists how many score peaks were removed by masks, spacing, amplitude-SNR and width decisions. A score peak above the line is therefore a candidate, not necessarily a detected event. **Run polarity-reversed control** reruns the selected cell in a worker thread with its saved detection settings and original CS/SS masks, then shows reversed versus original kept counts beside the candidate diagnostics. Reversed detections are a control, not an estimate of the false-positive count. Parallel matching groups amplitude-normalized template shapes using PCA and k-means. Set the number of groups on the second Template Matching row; View shows each group mean, template count, and checkboxes for enabling it. PCA-component count is in Advanced Settings. All requested groups are scored unless deselected, and the enabled groups are saved and reused in batch detection. With multiple groups, the displayed score is excess above each group's own cutoff, with zero as the line. More active groups can recover minority shapes but also add opportunities for false positives. Template detection retains the adjustable 700 Hz SS low-pass used to suppress the 1,112 Hz interference found in the supplied recording; set it to 0 to disable. SS widths use this filtered trace; both width limits are in the shared Spike QC panel. The original baseline-corrected trace remains the waveform/SNR review source. **Advanced Settings** is the only SS spacing control; its interval is applied once across all template groups. CS-exclusion settings also remain in effect. Inspect low-amplitude additions against manual marks; a higher count alone does not establish better accuracy.
-
-### Time, widths and exclusions (3.6.17)
-
-CSV/Excel time units are inferred automatically from first-column labels such as `t(ms)` or `time_s`, then from plausible sampling rates when the header has no units. Ambiguous unlabelled columns are rejected with a request to label the column. The inferred unit appears in the Info panel and exported settings. NPZ files always use `time_ms` and must have a matching `fs`. The loader rejects nonfinite, duplicate, decreasing or irregular timestamps (0.1% spacing tolerance), and nonfinite trace samples within the timed recording. If trace values extend below the last timestamp, only the fully timed prefix is analyzed; Info, batch issues, and exported settings warn about the excluded untimed tail. Add timestamps to include that tail. No source workbook is changed. Exported spike times preserve the input recording’s time origin.
-
-In **Advanced Settings**, set **SS exclusion before CS** and **SS exclusion after CS** independently. Legacy `SS_BLANK_MS=18` maps to 9 ms before and 9 ms after CS. Endpoints are included and durations round upward to whole samples, so masks can differ by a sample from older results. Excluded intervals are never replaced with zeros. Template scoring also excludes windows that touch masked samples or recording boundaries; this can enlarge the effective exclusion relative to the requested pre/post values. NPZ exports include the actual `cs_exclusion_mask`, `ss_exclusion_mask`, full recording duration and valid duration per cell/type. Displayed rates use recording time after the common initial/final blanks (`observed samples/fs`); CS-specific SS exclusions are not subtracted from this overall rate denominator. ACGs continue to use their actual per-type observation masks for exposure correction.
-
-Widths are measured at the detected event, with search bounds between neighboring candidates. Template candidates may align to the nearest waveform peak within 2 ms, rounded upward to whole native samples so low-rate recordings can inspect the nearest frame. Both CS and SS widths use their filtered detection waveforms in every method. An unmeasurable width is retained as **uncertain**, with a reason, instead of silently passing the width filter. The Detection Viewer draws a measured CS FWHM as a green horizontal line and a retained CS with uncertain width as a short green dash at the event time; the dash length does not represent a measured duration. Info and Spike Statistics report uncertainty counts; FWHM summaries exclude unknown widths. `event_fwhm_cs/ss` retain one slot per final event, including NaN. `width_quality_json` records candidate indices, aligned peaks, half-height crossings, widths, uncertainty reasons and width decisions, including rejected candidates. Statistical waveform sources are frozen at detection time.
-
-Filters must use valid bands strictly below Nyquist; zero disables a cutoff. Invalid filters or requested preprocessing failures are reported per session instead of silently falling back. The effective baseline window, mask sample counts, local-noise windows and filter settings are saved in `analysis_settings_json.effective_settings`. With denoising enabled, its upper frequency must not exceed 95% of Nyquist; adjust the denoise settings for low-sampling-rate recordings. These corrections can change detections compared with older versions.
-
-
-## Building a Windows EXE
-
-Run `python3 scripts/create_windows_bundle.py` in the repository to create `spike_detector_windows_build.zip`. Extract that ZIP on Windows, then double-click `build_windows_uv.bat`. The batch file uses uv to install Python 3.11, the GUI dependencies, and PyInstaller, checks the extracted source, and builds `dist\spike_detector\spike_detector.exe` in one-folder mode. The complete `dist\spike_detector` folder is needed to run the app. See `WINDOWS_BUILD.md` inside the ZIP for the exact steps. The source ZIP does not contain an EXE or downloaded dependencies; the first Windows build requires internet access.
-
-
-## Application icon and macOS app
-
-The supplied spike-trace picture is the program icon. Package assets include the unchanged source PNG, a multi-resolution Windows ICO, and a rounded macOS PNG/ICNS with transparent corners and margins. The macOS Qt application icon uses the rounded artwork too, so it agrees with the native bundle icon instead of overriding it with a square. The GUI sets its application/window icon when launched from Python or a packaged build; the Windows EXE embeds the ICO, and the macOS bundle uses the ICNS for Finder and Dock.
-
-On macOS, run `uv sync --python 3.11 --extra packaging`, then `.venv/bin/python -m PyInstaller --noconfirm --clean packaging/pyinstaller/spike_detector.spec`. Open `dist/Spike Detector.app`. Build on the target platform; the Windows builder still produces `dist\spike_detector\spike_detector.exe`. These locally built macOS bundles are not Developer-ID notarized.
-
-To regenerate the native icon files from the checked-in Windows and macOS PNGs, run `python scripts/create_app_icons.py` with Pillow and PyQt6 installed, then rebuild the application and refresh the Windows source ZIP. The original Windows artwork is 190×190; the macOS SVG places this unchanged image inside a rounded white tile and renders it with transparent margins. No trace detail is redrawn.
+If a recording is skipped, read the GUI message for the failed format/filter check. If SS detections disappear near CS, inspect the exclusion windows and template support. If detection looks inconsistent, check polarity, preprocessing, amplitude QC and uncertain widths before lowering cutoffs. Hover help describes individual controls. The raw-view scale bar uses the SD-equivalent robust noise estimate `σMAD = 1.4826 × median(|x − median(x)|)`, rather than unscaled MAD.

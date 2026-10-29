@@ -78,7 +78,7 @@ from .utils.boundaries import observation_bounds, observation_mask, protected_pr
 from .utils.saved_session import load_saved_detection_folder, load_saved_detection, json_safe
 from .utils.results import TemporaryDetectionStore, cleanup_legacy_temporaries, output_paths, publish_detection
 
-APP_VERSION = '3.6.50'
+APP_VERSION = '3.6.51'
 
 
 # Keep input help in one place so the same setting reads consistently in the
@@ -249,7 +249,7 @@ def _detect_observed_cell(raw, fs, params, baseline_params, frames, frame_mode, 
         cs_min_fwhm_ms=0.0,
         ss_low_cut=params.get('SS_LOW_CUT_HZ', 0.0),
         ss_high_cut=params.get('SS_HIGH_CUT_HZ', 0.0),
-        ss_min_dist_ms=params.get('SS_MIN_DIST_MS', 4.0),
+        ss_min_dist_ms=params.get('SS_MIN_DIST_MS', 3.0),
         ss_blank_ms=params.get('SS_BLANK_MS', 18.0),
         ss_mask_pre_ms=mask_windows(params)[0],
         ss_mask_post_ms=mask_windows(params)[1],
@@ -1504,8 +1504,10 @@ class MainWindow(QtWidgets.QMainWindow):
             'SS_LOW_CUT_HZ': 0.0,
             'SS_HIGH_CUT_HZ': 0.0,
             'SS_THRESHOLD_SIGMA': 3.0,
-            'SS_MIN_DIST_MS': 4.0,
+            'SS_MIN_DIST_MS': 3.0,
             'SS_BLANK_MS': 18.0,
+            'SS_MASK_PRE_MS': 4.0,
+            'SS_MASK_POST_MS': 6.0,
             'SS_MAX_FWHM_MS': 4.5,
             'INITIAL_BLANK_MS': 150.0,
                 'FINAL_BLANK_MS': 50.0,
@@ -3979,7 +3981,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                        f"groups={self.params.get('TEMPLATE_PARALLEL_GROUPS', 3)}, "
                                        f"PCA components={self.params.get('TEMPLATE_PARALLEL_COMPONENTS', 2)}; "
                                        + selection_text)
-                        summary.append(f"SS spacing: {self.params.get('SS_MIN_DIST_MS', 4.0):.2f} ms (Advanced Settings)")
+                        summary.append(f"SS spacing: {self.params.get('SS_MIN_DIST_MS', 3.0):.2f} ms (Advanced Settings)")
                         whitening_counts = {'applied': 0, 'skipped': 0}
                         whitening_reasons = set()
                         for session in (self.loaded_sessions[name] for name in completed_names):
@@ -4027,7 +4029,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         summary.append(
                             f"Simple threshold criteria: SS height >= {self.params.get('SS_THRESHOLD_SIGMA', 3.0):.2f}xMAD, "
                             f"CS FWHM > {self.params.get('CS_MIN_FWHM_MS', 4.0):.2f} ms, "
-                            f"SS min distance = {self.params.get('SS_MIN_DIST_MS', 4.0):.2f} ms, "
+                            f"SS min distance = {self.params.get('SS_MIN_DIST_MS', 3.0):.2f} ms, "
                             f"SS pre/post exclusion = {mask_windows(self.params)[0]:.2f}/{mask_windows(self.params)[1]:.2f} ms, "
                             f"SS max FWHM = "
                             f"({self.params.get('SS_MAX_FWHM_MS', 4.5):.2f} ms), "
@@ -4342,8 +4344,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 'SS_LOW_CUT_HZ': 0.0,
                 'SS_HIGH_CUT_HZ': 0.0,
                 'SS_THRESHOLD_SIGMA': 3.0,
-                'SS_MIN_DIST_MS': 4.0,
+                'SS_MIN_DIST_MS': 3.0,
                 'SS_BLANK_MS': 18.0,
+                'SS_MASK_PRE_MS': 4.0,
+                'SS_MASK_POST_MS': 6.0,
                 'SS_MAX_FWHM_MS': 4.5,
                 'INITIAL_BLANK_MS': 150.0,
                 'FINAL_BLANK_MS': 50.0,
@@ -5067,8 +5071,10 @@ class DetectionSettingsDialog(QtWidgets.QDialog):
             'SS_LOW_CUT_HZ': float(self.spin_ss_low.value()),
             'SS_HIGH_CUT_HZ': float(self.spin_ss_high.value()),
             'SS_THRESHOLD_SIGMA': float(self.spin_ss_thresh.value()),
-            'SS_MIN_DIST_MS': float(self.parent_win.params.get('SS_MIN_DIST_MS', 4.0)) if hasattr(self, 'parent_win') and self.parent_win is not None else 4.0,
+            'SS_MIN_DIST_MS': float(self.parent_win.params.get('SS_MIN_DIST_MS', 3.0)) if hasattr(self, 'parent_win') and self.parent_win is not None else 3.0,
             'SS_BLANK_MS': float(self.parent_win.params.get('SS_BLANK_MS', 18.0)) if hasattr(self, 'parent_win') and self.parent_win is not None else 18.0,
+            'SS_MASK_PRE_MS': mask_windows(self.parent_win.params if self.parent_win is not None else {})[0],
+            'SS_MASK_POST_MS': mask_windows(self.parent_win.params if self.parent_win is not None else {})[1],
         }
     # (Moved compute_baseline and export_figure into MainWindow)
 
@@ -7000,7 +7006,7 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow(self.chk_denoise_cs)
         # CS min dist and SS-specific params moved into Advanced Settings
         self.spin_cs_mind = QtWidgets.QDoubleSpinBox(); self.spin_cs_mind.setRange(0.0,1000.0); self.spin_cs_mind.setValue(p.get('CS_MIN_DIST_MS', 25.0))
-        self.spin_ss_mind = QtWidgets.QDoubleSpinBox(); self.spin_ss_mind.setRange(0.0,1000.0); self.spin_ss_mind.setValue(p.get('SS_MIN_DIST_MS', 4.0))
+        self.spin_ss_mind = QtWidgets.QDoubleSpinBox(); self.spin_ss_mind.setRange(0.0,1000.0); self.spin_ss_mind.setValue(p.get('SS_MIN_DIST_MS', 3.0))
         self.spin_ss_blank = QtWidgets.QDoubleSpinBox(); self.spin_ss_blank.setRange(0.0,1000.0); self.spin_ss_blank.setValue(p.get('SS_BLANK_MS', 18.0))
         self.spin_final_blank = QtWidgets.QDoubleSpinBox(); self.spin_final_blank.setRange(0.0, 5000.0); self.spin_final_blank.setValue(p.get('FINAL_BLANK_MS', 50.0))
         self.spin_initial_blank = QtWidgets.QDoubleSpinBox(); self.spin_initial_blank.setRange(0.0,5000.0); self.spin_initial_blank.setValue(p.get('INITIAL_BLANK_MS', 150.0))

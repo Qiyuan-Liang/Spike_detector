@@ -52,8 +52,10 @@ def validate_band(low, high, fs, order):
 
 def mask_windows(params):
     """Preserve legacy centered total-width settings unless explicit sides exist."""
-    half = float(params.get('SS_BLANK_MS', 18.0)) / 2.0
-    return float(params.get('SS_MASK_PRE_MS', half)), float(params.get('SS_MASK_POST_MS', half))
+    legacy_half = float(params['SS_BLANK_MS']) / 2.0 if 'SS_BLANK_MS' in params else None
+    pre_default = 4.0 if legacy_half is None else legacy_half
+    post_default = 6.0 if legacy_half is None else legacy_half
+    return float(params.get('SS_MASK_PRE_MS', pre_default)), float(params.get('SS_MASK_POST_MS', post_default))
 
 
 def effective_settings(params, baseline, frames, fs, n):

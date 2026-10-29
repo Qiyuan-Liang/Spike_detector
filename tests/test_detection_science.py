@@ -195,6 +195,7 @@ class ScienceTests(unittest.TestCase):
     def test_masks_have_explicit_sides(self):
         mask = exclusion_mask(100, 1000, [50], pre_ms=2, post_ms=5, initial_ms=3)
         np.testing.assert_array_equal(np.flatnonzero(mask), np.r_[0:3,48:56])
+        self.assertEqual(mask_windows({}), (4,6))
         self.assertEqual(mask_windows({'SS_BLANK_MS':18}), (9,9))
         self.assertEqual(mask_windows({'SS_BLANK_MS':18,'SS_MASK_PRE_MS':0,'SS_MASK_POST_MS':18}), (0,18))
         self.assertFalse(exclusion_mask(100,1000,[50]).any())
