@@ -86,6 +86,9 @@ class ComboTests(unittest.TestCase):
     def test_reset_turns_whitening_off_even_when_method_changes(self):
         win = MainWindow()
         try:
+            win.spin_template_cs_sigma.setValue(17)
+            win.spin_template_ss_sigma.setValue(8)
+            win.spin_ss_thresh.setValue(4.2)
             win.chk_template_whitening.setChecked(True)
             win.combo_template_method.setCurrentIndex(1)
             self.assertTrue(win._current_settings_snapshot()['params']['TEMPLATE_WHITENING'])
@@ -93,6 +96,9 @@ class ComboTests(unittest.TestCase):
                 win.reset_app()
             self.assertFalse(win.chk_template_whitening.isChecked())
             self.assertFalse(win.params['TEMPLATE_WHITENING'])
+            self.assertEqual(win.spin_template_cs_sigma.value(),30)
+            self.assertEqual(win.spin_template_ss_sigma.value(),5)
+            self.assertEqual(win.spin_ss_thresh.value(),3)
         finally:
             win.close()
 
@@ -119,7 +125,12 @@ class ComboTests(unittest.TestCase):
         win = MainWindow()
         try:
             self.assertIs(win.tabs_detection.cornerWidget(QtCore.Qt.Corner.TopRightCorner), win.chk_combo)
+            self.assertEqual(win.spin_template_cs_sigma.value(),30)
+            self.assertEqual(win.spin_template_ss_sigma.value(),5)
+            self.assertEqual(win.spin_ss_thresh.value(),3)
+            self.assertEqual(win.lbl_ss_threshold.text(),'Threshold (σ):')
             win.chk_combo.setChecked(True)
+            self.assertEqual(win.lbl_ss_threshold.text(),'Seed (σ):')
             win.chk_template_whitening.setChecked(True)
             self.assertTrue(win._current_settings_snapshot()['params']['COMBO_DETECTION'])
             win.tabs_detection.setCurrentIndex(1)

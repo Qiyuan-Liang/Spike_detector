@@ -37,6 +37,7 @@ from scipy.ndimage import percentile_filter
 from scipy.stats import median_abs_deviation
 import matplotlib
 matplotlib.use('QtAgg')
+matplotlib.rcParams['font.family'] = 'Arial'
 matplotlib.rcParams['svg.fonttype'] = 'none'
 matplotlib.rcParams['pdf.fonttype'] = 42
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -65,8 +66,9 @@ from .utils.denoise import default_denoise_config, adaptive_wavelet_denoise
 from .utils.session import (load_session_path, is_excel_lock_file,
                             _list_table_files_in_dir as list_table_files)
 from .utils.export import save_figure_with_dialog
+from .utils.event_metrics import event_dff_percent, peth_edges, session_time_courses
 from .utils.stats import (autocorrelogram_counts, autocorrelogram_components,
-                          recording_intervals_ms, mean_std_count)
+                          recording_intervals_ms, mean_std_count, triggered_rate_components, local_cv2_values)
 from .utils.validation import validate_session, effective_settings, mask_windows
 from .utils.widths import measure_width, measure_widths
 from .utils.combo import process_cell_combo
@@ -76,7 +78,7 @@ from .utils.boundaries import observation_bounds, observation_mask, protected_pr
 from .utils.saved_session import load_saved_detection_folder, load_saved_detection, json_safe
 from .utils.results import TemporaryDetectionStore, cleanup_legacy_temporaries, output_paths, publish_detection
 
-APP_VERSION = '3.6.47'
+APP_VERSION = '3.6.50'
 
 
 # Keep input help in one place so the same setting reads consistently in the
@@ -127,6 +129,12 @@ SETTING_TOOLTIPS = {
     'spin_cs_w': 'Duration of the extracted CS template waveform.',
     'spin_ss_w': 'Duration of the extracted SS template waveform.',
     'spin_cs_bg_alpha': 'Opacity of individual CS waveforms behind their mean.',
+    'spin_distribution_bins': 'Number of bins in FWHM, SNR, instantaneous-rate, dF/F and local CV2 distributions. Does not change ACG or CS-triggered rate bins.',
+    'spin_peth_pre_ms': 'Time before CS in the SS peri-event rate plot. This changes only statistics, not detection.',
+    'spin_peth_post_ms': 'Time after CS in the SS peri-event rate plot. At least one side of the range must be positive.',
+    'spin_peth_bin_ms': 'SS peri-CS rate bin width. Counts are divided by actual observed SS exposure; masked time is unavailable.',
+    'spin_ss_trend_s': 'Non-overlapping window in seconds for mean SS event dF/F and exposure-corrected SS rate. Sessions are never binned together.',
+    'spin_cs_trend_s': 'Non-overlapping window in seconds for mean CS event dF/F and exposure-corrected CS rate. Sessions are never binned together.',
     'spin_ss_bg_alpha': 'Opacity of individual SS waveforms behind their mean.',
     'spin_cs_acg_window': 'Maximum positive and negative CS lag shown in the autocorrelogram.',
     'spin_cs_acg_bin': 'Width of each CS autocorrelogram lag bin.',
@@ -254,9 +262,9 @@ def _detect_observed_cell(raw, fs, params, baseline_params, frames, frame_mode, 
     )
     if params.get('COMBO_DETECTION') or params.get('DETECTION_METHOD') == 'Template Matching':
         template_options = dict(
-            cs_thresh_sigma=params.get('TEMPLATE_CS_SIGMA', 6.0),
+            cs_thresh_sigma=params.get('TEMPLATE_CS_SIGMA', 30.0),
             cs_min_filtered_peak_sigma=0.0,
-            ss_thresh_sigma=params.get('TEMPLATE_SS_SIGMA', 3.0),
+            ss_thresh_sigma=params.get('TEMPLATE_SS_SIGMA', 5.0),
             template_match_method=params.get('TEMPLATE_MATCH_METHOD', 'LLR Probability Vector'),
             cs_similarity_threshold=params.get('TEMPLATE_CS_SIMILARITY', .90),
             ss_similarity_threshold=params.get('TEMPLATE_SS_SIMILARITY', .80),
@@ -273,7 +281,7 @@ def _detect_observed_cell(raw, fs, params, baseline_params, frames, frame_mode, 
         if params.get('COMBO_DETECTION'):
             result = process_cell_combo(raw_proc, fs, common=common,
                 seed_options=dict(cs_thresh_sigma=params.get('CS_THRESHOLD_SIGMA', 6.0),
-                    ss_thresh_sigma=params.get('SS_THRESHOLD_SIGMA', 2.5),
+                    ss_thresh_sigma=params.get('SS_THRESHOLD_SIGMA', 3.0),
                     local_baseline=bool(params.get('LOCAL_BASELINE', False)),
                     local_baseline_cs_ms=float(params.get('LOCAL_BASELINE_CS_MS', 200.0)),
                     local_baseline_ss_ms=float(params.get('LOCAL_BASELINE_SS_MS', 50.0))),
@@ -291,7 +299,7 @@ def _detect_observed_cell(raw, fs, params, baseline_params, frames, frame_mode, 
     else:
         result = run_with_qc(lambda **qc: process_cell_simple(raw_proc, fs,
             cs_thresh_sigma=params.get('CS_THRESHOLD_SIGMA', 6.0),
-            ss_thresh_sigma=params.get('SS_THRESHOLD_SIGMA', 2.5),
+            ss_thresh_sigma=params.get('SS_THRESHOLD_SIGMA', 3.0),
             local_baseline=bool(params.get('LOCAL_BASELINE', False)),
             local_baseline_cs_ms=float(params.get('LOCAL_BASELINE_CS_MS', 200.0)),
             local_baseline_ss_ms=float(params.get('LOCAL_BASELINE_SS_MS', 50.0)), **common, **qc), corrected * sign, fs, params)
@@ -1495,7 +1503,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'SS_MIN_FWHM_MS': 0.0,
             'SS_LOW_CUT_HZ': 0.0,
             'SS_HIGH_CUT_HZ': 0.0,
-            'SS_THRESHOLD_SIGMA': 2.5,
+            'SS_THRESHOLD_SIGMA': 3.0,
             'SS_MIN_DIST_MS': 4.0,
             'SS_BLANK_MS': 18.0,
             'SS_MAX_FWHM_MS': 4.5,
@@ -1513,8 +1521,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'TEMPLATE_PARALLEL_COMPONENTS': 2,
             'TEMPLATE_CS_SELECTED_GROUPS': None,
             'TEMPLATE_SS_SELECTED_GROUPS': None,
-            'TEMPLATE_CS_SIGMA': 6.0,
-            'TEMPLATE_SS_SIGMA': 3.0,
+            'TEMPLATE_CS_SIGMA': 30.0,
+            'TEMPLATE_SS_SIGMA': 5.0,
             'TEMPLATE_CS_SIMILARITY': 0.90,
             'TEMPLATE_SS_SIMILARITY': 0.80,
             'TEMPLATE_SS_LOWPASS_HZ': 700.0,
@@ -1543,6 +1551,12 @@ class MainWindow(QtWidgets.QMainWindow):
             'RAW_SCALE_BAR_UNIT': 'Sigma',
             'STATS_CS_BG_ALPHA': 0.3,
             'STATS_SS_BG_ALPHA': 0.003,
+            'STATS_DISTRIBUTION_BINS': 20,
+            'STATS_PETH_PRE_MS': 20.0,
+            'STATS_PETH_POST_MS': 60.0,
+            'STATS_PETH_BIN_MS': 1.0,
+            'STATS_SS_TREND_S': 5.0,
+            'STATS_CS_TREND_S': 5.0,
             'DETECTION_VIEW_WINDOW_MS': 1000.0,
             'DETECTION_VIEW_Y_RANGE': 0.0,
             'DETECTION_VIEW_CENTER': 0,
@@ -1737,7 +1751,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_ss_high.valueChanged.connect(lambda v: (self.params.update({'SS_HIGH_CUT_HZ': float(v)}), self.update_plot()))
         vbox_right.addWidget(QtWidgets.QLabel('SS high cut (Hz):'))
         vbox_right.addWidget(self.spin_ss_high)
-        self.spin_ss_thresh = QtWidgets.QDoubleSpinBox(); self.spin_ss_thresh.setRange(0.0,50.0); self.spin_ss_thresh.setDecimals(3); self.spin_ss_thresh.setSingleStep(0.05); self.spin_ss_thresh.setValue(self.params.get('SS_THRESHOLD_SIGMA',2.5))
+        self.spin_ss_thresh = QtWidgets.QDoubleSpinBox(); self.spin_ss_thresh.setRange(0.0,50.0); self.spin_ss_thresh.setDecimals(3); self.spin_ss_thresh.setSingleStep(0.05); self.spin_ss_thresh.setValue(self.params.get('SS_THRESHOLD_SIGMA',3.0))
         self.spin_ss_thresh.valueChanged.connect(lambda v: (self.params.update({'SS_THRESHOLD_SIGMA': float(v)}), self.update_plot()))
         vbox_right.addWidget(QtWidgets.QLabel('SS threshold (σ):'))
         vbox_right.addWidget(self.spin_ss_thresh)
@@ -1927,7 +1941,7 @@ class MainWindow(QtWidgets.QMainWindow):
         h_cs_sigma = QtWidgets.QHBoxLayout()
         self.lbl_template_cs_sigma = QtWidgets.QLabel('CS match response / noise MAD:')
         h_cs_sigma.addWidget(self.lbl_template_cs_sigma)
-        self.spin_template_cs_sigma = QtWidgets.QDoubleSpinBox(); self.spin_template_cs_sigma.setRange(0.1, 100.0); self.spin_template_cs_sigma.setDecimals(3); self.spin_template_cs_sigma.setSingleStep(0.1); self.spin_template_cs_sigma.setValue(float(self.params.get('TEMPLATE_CS_SIGMA', 6.0)))
+        self.spin_template_cs_sigma = QtWidgets.QDoubleSpinBox(); self.spin_template_cs_sigma.setRange(0.1, 100.0); self.spin_template_cs_sigma.setDecimals(3); self.spin_template_cs_sigma.setSingleStep(0.1); self.spin_template_cs_sigma.setValue(float(self.params.get('TEMPLATE_CS_SIGMA', 30.0)))
         self.spin_template_cs_sigma.setToolTip('LLR mode: positive template projection divided by the filtered trace’s unmasked per-sample MAD. Score line is cutoff² / 2; this is not a calibrated false-positive z-score.')
         self.spin_template_cs_sigma.valueChanged.connect(self.on_template_controls_changed)
         h_cs_sigma.addWidget(self.spin_template_cs_sigma)
@@ -1936,7 +1950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         h_ss_sigma = QtWidgets.QHBoxLayout()
         self.lbl_template_ss_sigma = QtWidgets.QLabel('SS match response / noise MAD:')
         h_ss_sigma.addWidget(self.lbl_template_ss_sigma)
-        self.spin_template_ss_sigma = QtWidgets.QDoubleSpinBox(); self.spin_template_ss_sigma.setRange(0.1, 100.0); self.spin_template_ss_sigma.setDecimals(3); self.spin_template_ss_sigma.setSingleStep(0.1); self.spin_template_ss_sigma.setValue(float(self.params.get('TEMPLATE_SS_SIGMA', 3.0)))
+        self.spin_template_ss_sigma = QtWidgets.QDoubleSpinBox(); self.spin_template_ss_sigma.setRange(0.1, 100.0); self.spin_template_ss_sigma.setDecimals(3); self.spin_template_ss_sigma.setSingleStep(0.1); self.spin_template_ss_sigma.setValue(float(self.params.get('TEMPLATE_SS_SIGMA', 5.0)))
         self.spin_template_ss_sigma.setToolTip('LLR mode: positive 3 ms template-core projection divided by the filtered trace’s unmasked per-sample MAD. This is not a calibrated false-positive z-score.')
         self.spin_template_ss_sigma.valueChanged.connect(self.on_template_controls_changed)
         h_ss_sigma.addWidget(self.spin_template_ss_sigma)
@@ -3142,7 +3156,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise ValueError('Invalid settings file format.')
 
             blockers = [QtCore.QSignalBlocker(w) for w in self.findChildren(QtWidgets.QWidget)
-                        if isinstance(w, (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox, QtWidgets.QCheckBox, QtWidgets.QTabBar, QtWidgets.QSlider))]
+                        if isinstance(w, (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox, QtWidgets.QCheckBox, QtWidgets.QTabBar, QtWidgets.QTabWidget, QtWidgets.QSlider))
+                        and w is not self.tabs_detection.tabBar()]
             loaded_params = cfg.get('params', {})
             loaded_baseline = cfg.get('baseline_params', {})
             loaded_colors = cfg.get('colors', {})
@@ -3294,6 +3309,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
             blockers.clear()
+            self.on_combo_changed(self.chk_combo.isChecked())
             self.params.pop('INPUT_TIME_UNIT', None)
             self.on_baseline_param_change()
             self.on_template_controls_changed()
@@ -3990,8 +4006,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         else:
                             summary.append(
                                 f"Template response/MAD cutoffs (not calibrated z-scores): "
-                                f"CS={self.params.get('TEMPLATE_CS_SIGMA', 6.0):.2f}, "
-                                f"SS={self.params.get('TEMPLATE_SS_SIGMA', 3.0):.2f}; "
+                                f"CS={self.params.get('TEMPLATE_CS_SIGMA', 30.0):.2f}, "
+                                f"SS={self.params.get('TEMPLATE_SS_SIGMA', 5.0):.2f}; "
                                 "amplitude/width checks use Spike QC"
                             )
                             if self.params.get('TEMPLATE_MATCH_METHOD') == 'Burst-aware LLR':
@@ -4009,7 +4025,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                 for label, key in counts))
                     else:
                         summary.append(
-                            f"Simple threshold criteria: SS height >= {self.params.get('SS_THRESHOLD_SIGMA', 2.5):.2f}xMAD, "
+                            f"Simple threshold criteria: SS height >= {self.params.get('SS_THRESHOLD_SIGMA', 3.0):.2f}xMAD, "
                             f"CS FWHM > {self.params.get('CS_MIN_FWHM_MS', 4.0):.2f} ms, "
                             f"SS min distance = {self.params.get('SS_MIN_DIST_MS', 4.0):.2f} ms, "
                             f"SS pre/post exclusion = {mask_windows(self.params)[0]:.2f}/{mask_windows(self.params)[1]:.2f} ms, "
@@ -4155,6 +4171,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 event_fwhm_ss.append(ss_fwhm_i)
                 event_minus_dff_percent_cs.append(np.asarray([_minus_dff_at_event(raw_proc_i, base_i, pp, 'CS') for pp in cs_peaks_i], dtype=float))
                 event_minus_dff_percent_ss.append(np.asarray([_minus_dff_at_event(raw_proc_i, base_i, pp, 'SS') for pp in ss_peaks_i], dtype=float))
+                for kind, peaks, values in (('cs', cs_peaks_i, event_minus_dff_percent_cs[-1]), ('ss', ss_peaks_i, event_minus_dff_percent_ss[-1])):
+                    r['event_minus_dff_percent_'+kind] = values.copy()
+                    r['dff_indices_'+kind] = peaks.copy()
                 event_waveforms_minus_dff_percent_cs.append(_event_waveforms_minus_dff(raw_proc_i, base_i, cs_peaks_i, 'CS'))
                 event_waveforms_minus_dff_percent_ss.append(_event_waveforms_minus_dff(raw_proc_i, base_i, ss_peaks_i, 'SS'))
         else:
@@ -4322,7 +4341,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 'SS_MIN_FWHM_MS': 0.0,
                 'SS_LOW_CUT_HZ': 0.0,
                 'SS_HIGH_CUT_HZ': 0.0,
-                'SS_THRESHOLD_SIGMA': 2.5,
+                'SS_THRESHOLD_SIGMA': 3.0,
                 'SS_MIN_DIST_MS': 4.0,
                 'SS_BLANK_MS': 18.0,
                 'SS_MAX_FWHM_MS': 4.5,
@@ -4340,8 +4359,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 'TEMPLATE_PARALLEL_COMPONENTS': 2,
                 'TEMPLATE_CS_SELECTED_GROUPS': None,
                 'TEMPLATE_SS_SELECTED_GROUPS': None,
-                'TEMPLATE_CS_SIGMA': 6.0,
-                'TEMPLATE_SS_SIGMA': 3.0,
+                'TEMPLATE_CS_SIGMA': 30.0,
+                'TEMPLATE_SS_SIGMA': 5.0,
                 'TEMPLATE_CS_SIMILARITY': 0.90,
                 'TEMPLATE_SS_SIMILARITY': 0.80,
                 'TEMPLATE_SS_LOWPASS_HZ': 700.0,
@@ -4370,6 +4389,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 'RAW_SCALE_BAR_UNIT': 'Sigma',
                 'STATS_CS_BG_ALPHA': 0.3,
                 'STATS_SS_BG_ALPHA': 0.003,
+                'STATS_DISTRIBUTION_BINS': 20,
+                'STATS_PETH_PRE_MS': 20.0,
+                'STATS_PETH_POST_MS': 60.0,
+                'STATS_PETH_BIN_MS': 1.0,
+                'STATS_SS_TREND_S': 5.0,
+                'STATS_CS_TREND_S': 5.0,
                 'DETECTION_VIEW_WINDOW_MS': 1000.0,
                 'DETECTION_VIEW_Y_RANGE': 0.0,
                 'DETECTION_VIEW_CENTER': 0,
@@ -4379,6 +4404,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 'SLIDER_VIEW_AUTO_START': True,
                 'DENOISE_SHOW_ADVANCED': False,
             }
+            # Template widget signals write back all matching controls together.
+            # Read reset targets from an immutable snapshot while restoring them.
+            template_defaults = dict(self.params)
             self._sync_polarity_buttons()
             self._restore_qc_controls(self.params)
             _set_user_linewidth_scale(self.params.get('LINE_WIDTH_SCALE', 0.7))
@@ -4416,16 +4444,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.spin_ss_blank.setValue(self.params['SS_BLANK_MS'])
                 self._set_frame_processing_mode(self.params['FRAME_PROCESSING_MODE'])
                 self.combo_template_method.setCurrentIndex(max(0, self.combo_template_method.findData(
-                    self.params['TEMPLATE_MATCH_METHOD'])))
+                    template_defaults['TEMPLATE_MATCH_METHOD'])))
                 if hasattr(self, 'chk_template_parallel') and self.chk_template_parallel is not None:
-                    self.chk_template_parallel.setChecked(bool(self.params.get('TEMPLATE_PARALLEL', False)))
+                    self.chk_template_parallel.setChecked(bool(template_defaults.get('TEMPLATE_PARALLEL', False)))
                 self.chk_template_whitening.setChecked(False)
-                self.spin_template_groups.setValue(self.params['TEMPLATE_PARALLEL_GROUPS'])
-                self.spin_template_cs_sigma.setValue(self.params['TEMPLATE_CS_SIGMA'])
-                self.spin_template_ss_sigma.setValue(self.params['TEMPLATE_SS_SIGMA'])
-                self.spin_template_cs_sim.setValue(self.params['TEMPLATE_CS_SIMILARITY'])
-                self.spin_template_ss_sim.setValue(self.params['TEMPLATE_SS_SIMILARITY'])
-                self.spin_template_lowpass.setValue(self.params['TEMPLATE_SS_LOWPASS_HZ'])
+                self.spin_template_groups.setValue(template_defaults['TEMPLATE_PARALLEL_GROUPS'])
+                self.spin_template_cs_sigma.setValue(template_defaults['TEMPLATE_CS_SIGMA'])
+                self.spin_template_ss_sigma.setValue(template_defaults['TEMPLATE_SS_SIGMA'])
+                self.spin_template_cs_sim.setValue(template_defaults['TEMPLATE_CS_SIMILARITY'])
+                self.spin_template_ss_sim.setValue(template_defaults['TEMPLATE_SS_SIMILARITY'])
+                self.spin_template_lowpass.setValue(template_defaults['TEMPLATE_SS_LOWPASS_HZ'])
                 if hasattr(self, 'chk_local_baseline') and self.chk_local_baseline is not None:
                     self.chk_local_baseline.setChecked(False)
                 if hasattr(self, 'spin_local_ss_ms') and self.spin_local_ss_ms is not None:
@@ -5012,7 +5040,7 @@ class DetectionSettingsDialog(QtWidgets.QDialog):
         self.spin_cs_thresh = QtWidgets.QDoubleSpinBox(); self.spin_cs_thresh.setRange(0.0, 50.0); self.spin_cs_thresh.setValue(p.get('CS_THRESHOLD_SIGMA',6.0))
         self.spin_ss_low = QtWidgets.QDoubleSpinBox(); self.spin_ss_low.setRange(0.0,5000.0); self.spin_ss_low.setValue(p.get('SS_LOW_CUT_HZ',0.0))
         self.spin_ss_high = QtWidgets.QDoubleSpinBox(); self.spin_ss_high.setRange(0.0,5000.0); self.spin_ss_high.setValue(p.get('SS_HIGH_CUT_HZ',0.0))
-        self.spin_ss_thresh = QtWidgets.QDoubleSpinBox(); self.spin_ss_thresh.setRange(0.0,50.0); self.spin_ss_thresh.setValue(p.get('SS_THRESHOLD_SIGMA',2.5))
+        self.spin_ss_thresh = QtWidgets.QDoubleSpinBox(); self.spin_ss_thresh.setRange(0.0,50.0); self.spin_ss_thresh.setValue(p.get('SS_THRESHOLD_SIGMA',3.0))
         form.addRow('CS low cut (Hz):', self.spin_cs_low)
         form.addRow('CS high cut (Hz):', self.spin_cs_high)
         form.addRow('CS threshold (σ):', self.spin_cs_thresh)
@@ -5186,7 +5214,7 @@ class SliderViewerDialog(QtWidgets.QDialog):
         if det.get('local_baseline', False) and 'ss_threshold_trace' in det:
             self.ax_ss.plot(t[mask], det['ss_threshold_trace'][mask], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
         elif not det.get('loaded_local_threshold_unavailable'):
-            self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 2.5) * det['sigma_ss'], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
+            self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 3.0) * det['sigma_ss'], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
 
         # overlay spikes
         cs_times = t[det['cs_peaks']]
@@ -5248,7 +5276,7 @@ class DetectionViewerDialog(QtWidgets.QDialog):
         # Controls: time slider, window, zoom
         # Session and cell selectors (allow switching between loaded sessions/cells)
         self.combo_session = QtWidgets.QComboBox()
-        self.combo_session.setMinimumContentsLength(16)
+        self.combo_session.setMinimumContentsLength(10)
         self.combo_session.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         parent = self.parent()
         session_names = []
@@ -5686,7 +5714,7 @@ class DetectionViewerDialog(QtWidgets.QDialog):
             if res.get('local_baseline', False) and 'ss_threshold_trace' in res:
                 self.ax_ss.plot(t[mask], np.asarray(res['ss_threshold_trace'])[mask], color=colors.get('ss_thresh', '#CC79A7'), ls='--')
             else:
-                self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 2.5) * res.get('sigma_ss', 0.0), color=colors.get('ss_thresh', '#CC79A7'), ls='--')
+                self.ax_ss.axhline(params.get('SS_THRESHOLD_SIGMA', 3.0) * res.get('sigma_ss', 0.0), color=colors.get('ss_thresh', '#CC79A7'), ls='--')
 
         cs_idx = np.asarray(res.get('cs_peaks', []), dtype=int)
         ss_idx = np.asarray(res.get('ss_peaks', []), dtype=int)
@@ -5734,7 +5762,7 @@ class DetectionViewerDialog(QtWidgets.QDialog):
             ss_half = max(ss_thresh * 1.25, ss_std * 5.0)
         else:
             cs_thresh = abs(params.get('CS_THRESHOLD_SIGMA', 6.0) * res.get('sigma_cs', 1.0))
-            ss_thresh = abs(params.get('SS_THRESHOLD_SIGMA', 2.5) * res.get('sigma_ss', 1.0))
+            ss_thresh = abs(params.get('SS_THRESHOLD_SIGMA', 3.0) * res.get('sigma_ss', 1.0))
             cs_half = max(cs_thresh * 1.5, cs_std * 3.0) * factor
             ss_half = max(ss_thresh * 1.5, ss_std * 3.0) * factor
         if cs_masked.size > 0:
@@ -6132,15 +6160,19 @@ class StatsViewerDialog(QtWidgets.QDialog):
     def __init__(self, data, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Spike Statistics')
-        self.resize(*_scaled_size(1600, 640))
+        available = self.screen().availableGeometry()
+        self.resize(min(1800, max(640, available.width()-40)), min(720, max(480, available.height()-80)))
+        self._page_index = 0
         self.data = data
-        self.fig = _make_figure(13, 8)
+        self.fig = _make_figure(16, 7)
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setMinimumSize(300, 240)
+        self.canvas.setSizePolicy(SIZEPOLICY_EXPANDING, SIZEPOLICY_EXPANDING)
         # Top control row: session selector, cell selector, Save Figure
         top_h = QtWidgets.QHBoxLayout()
         parent_win = parent
         self.combo_path = QtWidgets.QComboBox()
-        self.combo_path.setMinimumContentsLength(16)
+        self.combo_path.setMinimumContentsLength(10)
         self.combo_path.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.combo_path.setMaximumWidth(260)
         self.combo_path.addItem('All')
@@ -6183,20 +6215,30 @@ class StatsViewerDialog(QtWidgets.QDialog):
         self.spin_ss_bg_alpha.setValue(float(parent.params.get('STATS_SS_BG_ALPHA', 0.003)) if parent is not None else 0.003)
         self.spin_ss_bg_alpha.valueChanged.connect(self.compute_stats)
 
+        for combo in (self.combo_path, self.combo_session, self.combo_cell):
+            combo.setMinimumWidth(110)
+            combo.setMaximumWidth(240)
+            combo.setSizePolicy(SIZEPOLICY_EXPANDING, SIZEPOLICY_FIXED)
+        for control in (self.spin_cs_bg_alpha, self.spin_ss_bg_alpha):
+            control.setFixedWidth(78)
+
         top_h.addWidget(QtWidgets.QLabel('Path:'))
-        top_h.addWidget(self.combo_path)
+        top_h.addWidget(self.combo_path, 1)
         top_h.addWidget(QtWidgets.QLabel('Session:'))
-        top_h.addWidget(self.combo_session)
+        top_h.addWidget(self.combo_session, 1)
         top_h.addWidget(QtWidgets.QLabel('Cell:'))
-        top_h.addWidget(self.combo_cell)
+        top_h.addWidget(self.combo_cell, 1)
         top_h.addWidget(QtWidgets.QLabel('CS bg alpha:'))
         top_h.addWidget(self.spin_cs_bg_alpha)
         top_h.addWidget(QtWidgets.QLabel('SS bg alpha:'))
         top_h.addWidget(self.spin_ss_bg_alpha)
-        top_h.addStretch(1)
-        btn_save = QtWidgets.QPushButton('Save Figure')
-        btn_save.clicked.connect(self.save_figure)
-        top_h.addWidget(btn_save)
+        self.btn_next_page = QtWidgets.QPushButton('Next Page')
+        self.btn_next_page.setToolTip('Switch between waveform/ACG distributions and CS-triggered SS rate/local CV2. CV2 uses adjacent ISIs within continuous valid cell/session segments.')
+        self.btn_next_page.clicked.connect(self._next_page)
+        top_h.addWidget(self.btn_next_page)
+        self.btn_save = QtWidgets.QPushButton('Save Figure')
+        self.btn_save.clicked.connect(self.save_figure)
+        top_h.addWidget(self.btn_save)
 
         acg_h = QtWidgets.QHBoxLayout()
         acg_h.addWidget(QtWidgets.QLabel('Autocorrelogram:'))
@@ -6206,11 +6248,13 @@ class StatsViewerDialog(QtWidgets.QDialog):
             selected_bin = float(parent.params.get(prefix + 'BIN_MS', default_bin)) if parent is not None else default_bin
             window = QtWidgets.QDoubleSpinBox()
             window.setDecimals(1)
+            window.setFixedWidth(102)
             window.setRange(.1, 10000)
             window.setSuffix(' ms')
             window.setValue(selected_window)
             width = QtWidgets.QDoubleSpinBox()
             width.setDecimals(1)
+            width.setFixedWidth(92)
             width.setRange(.1, window.value())
             width.setSuffix(' ms')
             width.setValue(selected_bin)
@@ -6223,11 +6267,43 @@ class StatsViewerDialog(QtWidgets.QDialog):
             window.valueChanged.connect(width.setMaximum)
             window.valueChanged.connect(self.compute_stats)
             width.valueChanged.connect(self.compute_stats)
+        self.spin_distribution_bins = QtWidgets.QSpinBox()
+        self.spin_distribution_bins.setRange(1, 200)
+        self.spin_distribution_bins.setFixedWidth(74)
+        self.spin_distribution_bins.setValue(int(parent.params.get('STATS_DISTRIBUTION_BINS', 20)) if parent is not None else 20)
+        self.spin_distribution_bins.valueChanged.connect(self.compute_stats)
         acg_h.addStretch(1)
+        self.page_controls = QtWidgets.QStackedWidget()
+        acg_page = QtWidgets.QWidget(); acg_page.setLayout(acg_h)
+        self.page_controls.addWidget(acg_page)
+        temporal = QtWidgets.QHBoxLayout()
+        settings = (('spin_peth_pre_ms','Before CS:','STATS_PETH_PRE_MS',20.,' ms',0.,10000.),
+            ('spin_peth_post_ms','After:','STATS_PETH_POST_MS',60.,' ms',0.,10000.),
+            ('spin_peth_bin_ms','Bin:','STATS_PETH_BIN_MS',1.,' ms',.1,1000.),
+            ('spin_ss_trend_s','SS rate window:','STATS_SS_TREND_S',5.,' s',.1,600.),
+            ('spin_cs_trend_s','CS rate window:','STATS_CS_TREND_S',5.,' s',.1,600.))
+        temporal.addWidget(QtWidgets.QLabel('SS PETH:'))
+        for name,label,key,default,suffix,minimum,maximum in settings:
+            control=QtWidgets.QDoubleSpinBox(); control.setDecimals(1)
+            control.setRange(minimum,maximum); control.setSuffix(suffix); control.setFixedWidth(90)
+            control.setValue(float(parent.params.get(key,default)) if parent is not None else default)
+            setattr(self,name,control)
+            temporal.addWidget(QtWidgets.QLabel(label));temporal.addWidget(control)
+        self.spin_peth_pre_ms.valueChanged.connect(lambda value:self.spin_peth_post_ms.setMinimum(.1 if value==0 else 0))
+        self.spin_peth_post_ms.setMinimum(.1 if self.spin_peth_pre_ms.value()==0 else 0)
+        for name,*_ in settings:
+            getattr(self,name).valueChanged.connect(self.compute_stats)
+        temporal.addStretch(1)
+        temporal_page=QtWidgets.QWidget();temporal_page.setLayout(temporal)
+        self.page_controls.addWidget(temporal_page)
+        controls_row=QtWidgets.QHBoxLayout()
+        controls_row.addWidget(self.page_controls,1)
+        controls_row.addWidget(QtWidgets.QLabel('Distribution bins:'))
+        controls_row.addWidget(self.spin_distribution_bins)
 
         layout = QtWidgets.QVBoxLayout()
         layout.addLayout(top_h)
-        layout.addLayout(acg_h)
+        layout.addLayout(controls_row)
         layout.addWidget(self.canvas)
         self.setLayout(layout)
         _apply_setting_tooltips(self)
@@ -6236,6 +6312,167 @@ class StatsViewerDialog(QtWidgets.QDialog):
         self._on_session_change(0)
         # initial plot
         self.compute_stats()
+
+    def _next_page(self):
+        self._page_index = 1-self._page_index
+        self.page_controls.setCurrentIndex(self._page_index)
+        self.btn_next_page.setText('Previous Page' if self._page_index else 'Next Page')
+        self.compute_stats()
+
+    @staticmethod
+    def _style_axes(axes):
+        for axis in axes:
+            axis.spines[['top', 'right']].set_visible(False)
+            axis.tick_params(labelsize=8)
+            axis.title.set_fontsize(10)
+            axis.xaxis.label.set_size(9)
+            axis.yaxis.label.set_size(9)
+            if axis.axison:
+                if not getattr(axis, '_stats_wide', False):
+                    axis.set_box_aspect(1)
+
+    def _plot_temporal_stats(self, items, colors, manual_summary):
+        edges = peth_edges(self.spin_peth_pre_ms.value(),self.spin_peth_post_ms.value(),self.spin_peth_bin_ms.value())
+        n_bins = edges.size-1
+        counts, exposure = np.zeros(n_bins, dtype=int), np.zeros(n_bins)
+        cv2 = {'CS': [], 'SS': []}
+        dff = {'CS': [], 'SS': []}
+        records = {'CS': [], 'SS': []}
+        references, used = 0, 0
+        for res, data, cell in items:
+            if not isinstance(res, dict):
+                continue
+            time = np.asarray(data['time_ms'], dtype=float)
+            intervals, times, available = {}, {}, {}
+            run_params = data.get('_saved_detection_params', data.get('_control_context', {}).get('params', {}))
+            for kind in ('CS', 'SS'):
+                prefix = kind.lower()
+                peaks = np.asarray(res.get(prefix+'_peaks', []), dtype=int)
+                peaks = peaks[(peaks >= 0) & (peaks < time.size)]
+                times[kind] = time[peaks]
+                excluded = np.asarray(res.get(prefix+'_exclusion_mask', np.zeros(time.size, bool)), bool)
+                excluded = excluded | np.asarray(res.get('recording_exclusion_mask', np.zeros(time.size, bool)), bool)
+                intervals[kind] = recording_intervals_ms(time, float(data['fs']), excluded)
+                info = res.get(prefix+'_candidate_diagnostics', {})
+                available[kind] = bool(res.get(prefix+'_detection_enabled', True)) and not info.get('no_templates', False)
+                if not res.get('manual_labels') and 'Template' not in str(res.get('det_method', '')):
+                    available[kind] &= run_params.get(kind+'_THRESHOLD_SIGMA', 1) != 0
+                if available[kind]:
+                    cv2[kind].extend(local_cv2_values(times[kind], intervals[kind]))
+                    amplitudes = self._event_amplitudes(data,cell,res,kind)
+                    dff[kind].extend(amplitudes[np.isfinite(amplitudes)])
+                    records[kind].append(dict(session_key=id(data), times_s=(times[kind]-time[0])/1000,
+                        dff_percent=amplitudes, intervals_s=(intervals[kind]-time[0])/1000))
+            if available['CS'] and available['SS']:
+                c, e, n = triggered_rate_components(times['CS'], times['SS'], edges,
+                    intervals['CS'], intervals['SS'])
+                counts += c; exposure += e; references += n
+                used += int(n > 0)
+        rate = np.divide(counts, exposure, out=np.full(n_bins, np.nan), where=exposure > 0)
+        sessions = self._selected_session_catalog()
+        courses = {kind:session_time_courses(sessions,records[kind],getattr(self,'spin_'+kind.lower()+'_trend_s').value()) for kind in ('CS','SS')}
+        self.temporal_statistics = dict(edges_ms=edges, counts=counts, exposure_s=exposure,
+            rate_hz=rate, cs_references=references, recordings=used,
+            cv2={kind: np.asarray(values) for kind, values in cv2.items()},
+            dff_percent={kind:np.asarray(values) for kind,values in dff.items()}, courses=courses)
+        self.fig.clf()
+        grid = self.fig.add_gridspec(2,4,width_ratios=[1,1,1.65,1.1],wspace=.66,hspace=.52)
+        self.fig.subplots_adjust(left=.045,right=.97,bottom=.15,top=.91)
+        for row,kind in enumerate(('SS','CS')):
+            color=colors[kind.lower()+'_trace']
+            values=self.temporal_statistics['cv2'][kind]
+            ax=self.fig.add_subplot(grid[row,0]);ax.set_gid(kind.lower()+'_cv2')
+            if values.size:
+                ax.hist(values,bins=int(self.spin_distribution_bins.value()),range=(0,2),color=color,alpha=.8)
+                ax.axvline(np.mean(values),color=color,ls='--',label=f'Mean {np.mean(values):.2f}')
+                ax.legend(frameon=False,fontsize=7)
+            else:
+                ax.text(.5,.5,'No valid ISI triplets',ha='center',transform=ax.transAxes,fontsize=8)
+            ax.set(xlim=(0,2),title=kind+' local CV2',xlabel='CV2',ylabel='Count')
+            ax=self.fig.add_subplot(grid[row,1]);ax.set_gid(kind.lower()+'_dff')
+            values=self.temporal_statistics['dff_percent'][kind]
+            if values.size:
+                ax.hist(values,bins=int(self.spin_distribution_bins.value()),color=color,alpha=.8)
+            else:
+                ax.text(.5,.5,'No valid event dF/F',ha='center',transform=ax.transAxes,fontsize=8)
+            ax.set(title=kind+' dF/F',xlabel='Spike dF/F (%)',ylabel='Count')
+            ax=self.fig.add_subplot(grid[row,2]);ax.set_gid(kind.lower()+'_trend')
+            ax._stats_wide=True;ax.set_box_aspect(1/1.65)
+            ax.set(title=kind+' over time',xlabel='Concatenated recording time (s)',ylabel='Spike dF/F (%)')
+            course=courses[kind]
+            if course['reason']:
+                ax.text(.5,.5,course['reason'],ha='center',va='center',wrap=True,transform=ax.transAxes,fontsize=8)
+                continue
+            twin=ax.twinx();twin.set_gid(kind.lower()+'_rate');twin._stats_wide=True
+            twin.set_ylabel('Rate (Hz)',color='#4C72B0',fontsize=9)
+            for segment in course['segments']:
+                ax.plot(segment['time_s'],segment['dff_percent'],color=color,lw=_get_linewidth(1.5))
+                twin.plot(segment['time_s'],segment['rate_hz'],color='#4C72B0',lw=_get_linewidth(1.3))
+            for boundary in course['boundaries_s']:
+                ax.axvline(boundary,color='.6',ls=':',lw=_get_linewidth(.7))
+            ax.set_xlim(0,course['duration_s']);ax.tick_params(axis='y',labelcolor=color)
+            ax.yaxis.label.set_color(color);twin.tick_params(axis='y',labelcolor='#4C72B0')
+            twin.set_ylim(bottom=0)
+            if not any(np.any(np.isfinite(segment['dff_percent'])) for segment in course['segments']):
+                ax.text(.5,.85,'No finite dF/F',ha='center',transform=ax.transAxes,fontsize=8)
+        axis=self.fig.add_subplot(grid[:,3]);axis.set_gid('cs_ss_peth')
+        axis.stairs(rate,edges,color=colors['ss_trace'],linewidth=_get_linewidth(1.6))
+        axis.axvline(0,color='.4',ls=':',lw=_get_linewidth(.9))
+        axis.set(xlim=(edges[0],edges[-1]),ylim=(0,max(1,float(np.nanmax(rate))*1.12) if np.any(np.isfinite(rate)) else 1),
+            title='CS-triggered SS rate',xlabel='Time relative to CS (ms)',ylabel='SS rate (Hz)')
+        missing=exposure<=0
+        boundaries=np.flatnonzero(np.diff(np.r_[False,missing,False]))
+        for left,right in boundaries.reshape(-1,2):
+            axis.axvspan(edges[left],edges[right],color='.85',alpha=.6,lw=0)
+        if not references:
+            axis.text(.5,.5,'No eligible CS triggers',ha='center',transform=axis.transAxes,fontsize=8)
+        axis.text(0,-.27,f'{references} CS triggers',transform=axis.transAxes,fontsize=8)
+        self._style_axes(self.fig.axes)
+        for axis in self.fig.axes:
+            if axis.get_gid() in ('ss_rate','cs_rate'):
+                axis.spines['right'].set_visible(True)
+        footer='dF/F uses saved event amplitudes (comparison method). Blue: rate; dotted lines: session joins. Grey PETH bins: no SS exposure.'
+        if manual_summary:
+            footer+='\nManual labels are partial/unverified.'
+        self.fig.text(.045,.035,footer,fontsize=8,va='bottom')
+        self.canvas.draw()
+
+    def _selected_session_catalog(self):
+        parent=self.parent()
+        names=self._path_session_names() if self.combo_session.currentText()=='All' else [self.combo_session.currentText()]
+        sessions=[]
+        for name in names:
+            data=parent.loaded_sessions.get(name) if parent is not None else None
+            if data is None:
+                continue
+            source=data.get('source_folder') or (str(Path(data['session_path']).parent) if data.get('session_path') else None)
+            source_name=Path(data.get('source_session_id',data.get('session_path',name))).name
+            sessions.append(dict(key=id(data),name=source_name,folder=source,
+                duration_s=len(data['time_ms'])/float(data['fs'])))
+        return sessions
+
+    def _event_amplitudes(self,data,cell,res,kind):
+        prefix=kind.lower();peaks=np.asarray(res.get(prefix+'_peaks',[]),int)
+        values=res.get('event_minus_dff_percent_'+prefix)
+        saved = (np.asarray(values,float).ravel() if values is not None and np.array_equal(res.get('dff_indices_'+prefix,peaks),peaks) else None)
+        if saved is not None and saved.size>=peaks.size:
+            return saved[:peaks.size]
+        if data.get('loaded_detection_result'):
+            trace=np.asarray(data['processed_raw_data'][:,cell],float)
+            baseline=np.asarray(data['baseline_traces'][:,cell],float)
+        else:
+            context=data.get('_control_context',{})
+            params=context.get('params',getattr(self.parent(),'params',{}))
+            base=context.get('baseline_params',getattr(self.parent(),'baseline_params',dict(method='Median',window_ms=30,percentile=20)))
+            trace,baseline,_=protected_preprocess(data['raw_data'][:,cell],float(data['fs']),params,base,
+                context.get('frames',0),context.get('frame_mode','Rolling average'))
+        valid=~np.asarray(res.get('recording_exclusion_mask',np.zeros(len(trace),bool)),bool)
+        values=event_dff_percent(trace,baseline,peaks,float(data['fs']),res.get('negative_going',True),valid)
+        if saved is not None:
+            values[:saved.size]=saved  # Explicit saved NaNs stay missing; only absent slots are recomputed.
+        res['event_minus_dff_percent_'+prefix]=values
+        res['dff_indices_'+prefix]=peaks.copy()
+        return values
 
     def _path_session_names(self):
         parent = self.parent()
@@ -6366,6 +6603,11 @@ class StatsViewerDialog(QtWidgets.QDialog):
                     for idx, res in enumerate(sdata.get('results', [])):
                         items.append((res, sdata, idx))
 
+        bins = int(self.spin_distribution_bins.value())
+        if parent is not None:
+            parent.params['STATS_DISTRIBUTION_BINS'] = bins
+            for key,name in (('STATS_PETH_PRE_MS','spin_peth_pre_ms'),('STATS_PETH_POST_MS','spin_peth_post_ms'),('STATS_PETH_BIN_MS','spin_peth_bin_ms'),('STATS_SS_TREND_S','spin_ss_trend_s'),('STATS_CS_TREND_S','spin_cs_trend_s')):
+                parent.params[key]=getattr(self,name).value()
         # Now compute stats across collected items
         all_stats = {'CS': {'waves': [], 'snr': [], 'fwhm': [], 'inst_rate': []}, 'SS': {'waves': [], 'snr': [], 'fwhm': [], 'inst_rate': []}}
         acg_settings = {
@@ -6388,6 +6630,9 @@ class StatsViewerDialog(QtWidgets.QDialog):
         items = [(res, data, cell) for res, data, cell in items
                  if not data.get('is_manual_labels') or cell in data.get('label_metadata', {}).get('labelled_cells', [])]
         manual_summary = any(data.get('is_manual_labels') for _, data, _ in items)
+        if self._page_index:
+            self._plot_temporal_stats(items, colors, manual_summary)
+            return
         for res, sdata, cell_idx in items:
             if res is None or sdata is None:
                 continue
@@ -6482,9 +6727,9 @@ class StatsViewerDialog(QtWidgets.QDialog):
 
         # Plot: 2 rows x 6 cols (last col for text summary)
         self.fig.clf()
-        gs = self.fig.add_gridspec(2, 6, width_ratios=[1.0, 1.0, 1.0, 1.0, 1.0, 0.8],
-                                   wspace=0.4, hspace=0.5)
-        self.fig.subplots_adjust(left=0.08, right=0.855)
+        gs = self.fig.add_gridspec(2, 6, width_ratios=[1, 1, 1, 1, 1, 1.55],
+                                   wspace=0.46, hspace=0.48)
+        self.fig.subplots_adjust(left=.04, right=.99, bottom=.12, top=.91)
 
         def _robust_hist_range(arr, q_lo=0.01, q_hi=0.99, floor_zero=True):
             x = np.asarray(arr, dtype=float)
@@ -6616,7 +6861,7 @@ class StatsViewerDialog(QtWidgets.QDialog):
             if len(fwhm) > 0:
                 fwhm_arr = np.asarray(fwhm, dtype=float)
                 fwhm_arr = fwhm_arr[np.isfinite(fwhm_arr)]
-                ax2.hist(fwhm_arr, bins=20, color=color, alpha=0.8)
+                ax2.hist(fwhm_arr, bins=bins, color=color, alpha=0.8)
                 ax2.set_title('FWHM')
                 if fwhm_arr.size > 0:
                     lo = max(0.0, float(np.nanmin(fwhm_arr)) * 0.95)
@@ -6642,9 +6887,9 @@ class StatsViewerDialog(QtWidgets.QDialog):
                 snr_arr = snr_arr[np.isfinite(snr_arr)]
                 snr_range = _robust_hist_range(snr_arr, q_lo=0.01, q_hi=0.99, floor_zero=True)
                 if snr_range is not None:
-                    ax3.hist(snr_arr, bins=20, range=snr_range, color=color, alpha=0.8)
+                    ax3.hist(snr_arr, bins=bins, range=snr_range, color=color, alpha=0.8)
                 else:
-                    ax3.hist(snr_arr, bins=20, color=color, alpha=0.8)
+                    ax3.hist(snr_arr, bins=bins, color=color, alpha=0.8)
                 ax3.set_title('SNR')
                 if snr_arr.size > 0:
                     if snr_range is not None and snr_range[1] > snr_range[0]:
@@ -6673,9 +6918,9 @@ class StatsViewerDialog(QtWidgets.QDialog):
                 rate_arr = rate_arr[np.isfinite(rate_arr)]
                 rate_range = _robust_hist_range(rate_arr, q_lo=0.01, q_hi=0.99, floor_zero=True)
                 if rate_range is not None:
-                    ax4.hist(rate_arr, bins=20, range=rate_range, color=color, alpha=0.8)
+                    ax4.hist(rate_arr, bins=bins, range=rate_range, color=color, alpha=0.8)
                 else:
-                    ax4.hist(rate_arr, bins=20, color=color, alpha=0.8)
+                    ax4.hist(rate_arr, bins=bins, color=color, alpha=0.8)
                 ax4.set_title('Instantaneous rate')
                 if rate_arr.size > 0:
                     if rate_range is not None and rate_range[1] > rate_range[0]:
@@ -6713,12 +6958,15 @@ class StatsViewerDialog(QtWidgets.QDialog):
                 txt_lines.append(f"Inst rate: {ss_inst_mean:.2f}±{ss_inst_std:.2f} Hz (n={ss_inst_n})")
             txt_lines.append(f"Uncertain widths: {uncertain_counts[spike_type]}")
             txt_lines.append(f"Valid time: {valid_seconds[spike_type]:.2f} cell-s")
-            txt_lines.append('Rate excludes recording boundary blanks')
             if manual_summary:
                 txt_lines[0] = txt_lines[0].replace('Rate:', 'Label/mixed rate:')
                 txt_lines.append('Manual labels: partial/unverified')
-            ax_txt.text(0.02, 0.5, '\n'.join(txt_lines), va='center', ha='left', fontsize=10)
+            import textwrap
+            width_chars = max(20, min(33, int(ax_txt.get_position().width * (self.width()-40) / 6.5)))
+            summary = '\n'.join(textwrap.fill(line, width=width_chars, break_long_words=False, break_on_hyphens=False) for line in txt_lines)
+            ax_txt.text(0.02, 0.5, summary, va='center', ha='left', fontsize=8.5)
 
+        self._style_axes(self.fig.axes)
         self.canvas.draw()
 
     def save_figure(self):
@@ -7084,7 +7332,17 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_preview()
+
+    def hideEvent(self, event):
+        self._preview_timer.stop()
+        super().hideEvent(event)
+
     def _schedule_preview(self, *_args):
+        if not self.isVisible():
+            return
         try:
             self._preview_timer.start()
         except Exception:
@@ -7153,6 +7411,8 @@ class DenoisingSettingsDialog(QtWidgets.QDialog):
         return '; '.join(notes) if notes else 'No parameter extremes flagged; inspect waveform preservation'
 
     def run_preview(self):
+        if not self.isVisible():
+            return
         if self.parent_win is None or not hasattr(self.parent_win, '_get_current_corrected_signal_full'):
             return
         sig, t, fs = self.parent_win._get_current_corrected_signal_full()

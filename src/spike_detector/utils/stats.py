@@ -91,3 +91,75 @@ def autocorrelogram_components(event_times_ms, window_ms, bin_ms, observation_in
         shifted_edges = times[start:start+1024, None] + edges
         exposure_ms += np.maximum(np.diff(observed_time_at(shifted_edges), axis=1), 0).sum(axis=0)
     return edges, counts, exposure_ms / 1000.0
+
+
+def _validated_intervals(intervals):
+    intervals = np.asarray(intervals, dtype=float).reshape(-1, 2)
+    if (not np.all(np.isfinite(intervals)) or np.any(intervals[:, 1] <= intervals[:, 0]) or
+            np.any(intervals[1:, 0] < intervals[:-1, 1])):
+        raise ValueError('Observation intervals must be finite, positive, sorted and disjoint.')
+    return intervals
+
+
+def _observed_events(times, intervals):
+    times = np.asarray(times, dtype=float).ravel()
+    times = np.unique(times[np.isfinite(times)])
+    if not len(intervals):
+        return times[:0]
+    indices = np.searchsorted(intervals[:, 0], times, side='right') - 1
+    return times[(indices >= 0) & (times < intervals[np.maximum(indices, 0), 1])]
+
+
+def triggered_rate_components(reference_times_ms, target_times_ms, edges_ms,
+                              reference_intervals_ms, target_intervals_ms):
+    """Within-cell/session trigger counts and observable target exposure in seconds.
+
+    Pool counts AND exposure over recordings before division. Bins are [left,
+    right); zero exposure means unavailable, never observed silence. Reference
+    validity is independent of target validity (e.g. SS masks around valid CS).
+    """
+    edges = np.asarray(edges_ms, dtype=float)
+    if edges.ndim != 1 or edges.size < 2 or not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0):
+        raise ValueError('Lag edges must be finite and strictly increasing.')
+    reference_intervals = _validated_intervals(reference_intervals_ms)
+    target_intervals = _validated_intervals(target_intervals_ms)
+    refs = _observed_events(reference_times_ms, reference_intervals)
+    targets = _observed_events(target_times_ms, target_intervals)
+    counts = np.zeros(edges.size-1, dtype=np.int64)
+    exposure_ms = np.zeros_like(counts, dtype=float)
+    if not len(refs) or not len(target_intervals):
+        return counts, exposure_ms, int(len(refs))
+    for reference in refs:
+        lo, hi = np.searchsorted(targets, reference + edges[[0, -1]], side='left')
+        counts += np.histogram(targets[lo:hi] - reference, bins=edges)[0]
+    lengths = np.diff(target_intervals, axis=1).ravel()
+    prefix = np.r_[0.0, np.cumsum(lengths)]
+
+    def observed_time_at(values):
+        index = np.searchsorted(target_intervals[:, 0], values, side='right')-1
+        safe = np.maximum(index, 0)
+        return np.where(index >= 0,
+            prefix[safe] + np.clip(values-target_intervals[safe, 0], 0, lengths[safe]), 0)
+
+    for start in range(0, len(refs), 1024):
+        shifted = refs[start:start+1024, None] + edges
+        exposure_ms += np.maximum(np.diff(observed_time_at(shifted), axis=1), 0).sum(axis=0)
+    return counts, exposure_ms/1000.0, int(len(refs))
+
+
+def local_cv2_values(event_times_ms, observation_intervals_ms):
+    """Local CV2=2|ISI[i+1]-ISI[i]|/(ISI[i+1]+ISI[i]) (Holt et al., 1996).
+
+    Each value uses three consecutive spikes inside ONE uninterrupted observed
+    segment. Never bridge masked gaps, cells or sessions. Return local values,
+    not squared CV and not the distribution of per-cell mean CV2.
+    """
+    intervals = _validated_intervals(observation_intervals_ms)
+    times = _observed_events(event_times_ms, intervals)
+    values = []
+    for left, right in intervals:
+        lo, hi = np.searchsorted(times, [left, right], side='left')
+        isi = np.diff(times[lo:hi])
+        if isi.size >= 2:
+            values.append(2*np.abs(np.diff(isi))/(isi[1:]+isi[:-1]))
+    return np.concatenate(values) if values else np.empty(0, dtype=float)

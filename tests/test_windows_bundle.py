@@ -37,7 +37,7 @@ class WindowsBundleTests(unittest.TestCase):
             for extension in ('png', 'ico', 'icns'):
                 self.assertIn(f'src/spike_detector/assets/spike_detector.{extension}', names)
             self.assertIn('spike_detector_launcher.py', names)
-            self.assertTrue(all(name.startswith(('src/spike_detector/', 'scripts/', 'packaging/pyinstaller/')) or
+            self.assertTrue(all(name.startswith(('src/spike_detector/', 'scripts/', 'packaging/pyinstaller/','docs/gui/')) or
                                 name in {'.python-version','pyproject.toml','requirements.txt','README.md',
                                          'WINDOWS_BUILD.md','build_windows_uv.bat','spike_detector_launcher.py',
                                          'BUNDLE_MANIFEST.json'} for name in names))

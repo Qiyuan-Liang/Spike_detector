@@ -30,6 +30,12 @@ REQUIRED = (
     'src/spike_detector/assets/spike_detector_macos.svg',
     'src/spike_detector/assets/spike_detector.ico',
     'src/spike_detector/assets/spike_detector.icns',
+    'docs/gui/main-window.png',
+    'docs/gui/detection-viewer.png',
+    'docs/gui/statistics-overview.png',
+    'docs/gui/statistics-details.png',
+    'docs/gui/statistics-details.svg',
+    'docs/gui/example-settings.json',
 )
 
 

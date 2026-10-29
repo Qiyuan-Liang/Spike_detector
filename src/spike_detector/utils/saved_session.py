@@ -198,6 +198,10 @@ def load_saved_detection(path):
                         raise ValueError(f'Saved {kind.upper()} {label} does not match event count.')
                 res['event_amplitude_snr_'+kind] = snrs if snrs is not None else np.full(len(peaks), np.nan)
                 res['amplitude_snr_indices_'+kind] = peaks.copy()
+                dff=_cell_values(z,'event_minus_dff_percent_'+kind,cell,cells)
+                if dff is not None:
+                    res['event_minus_dff_percent_'+kind]=np.asarray(dff,float)
+                    res['dff_indices_'+kind]=peaks.copy()
                 rows = widths[cell].get('event_widths_'+kind)
                 if rows is None:
                     rows = [dict(candidate_index=int(p), peak_index=int(p), fwhm_ms=float(w),

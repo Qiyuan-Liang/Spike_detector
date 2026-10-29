@@ -64,7 +64,7 @@ class SavedSessionTests(unittest.TestCase):
             self.assertEqual(self.win.spin_baseline_window.value(), 30)
             for kind in ('cs', 'ss'):
                 a, b = self.original['results'][0], loaded['results'][0]
-                for key in (kind+'_peaks', kind+'_trace', kind+'_exclusion_mask', 'event_amplitude_snr_'+kind):
+                for key in (kind+'_peaks', kind+'_trace', kind+'_exclusion_mask', 'event_amplitude_snr_'+kind, 'event_minus_dff_percent_'+kind):
                     np.testing.assert_allclose(a[key], b[key], equal_nan=True)
             self.win.spin_avg_frames.setValue(7)
             self.win.spin_baseline_window.setValue(900)
